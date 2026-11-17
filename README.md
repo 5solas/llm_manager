@@ -14,7 +14,7 @@
 ## 처음 설정하는 순서
 
 ```powershell
-git clone https://github.com/<계정>/llm_manager
+git clone https://github.com/5solas/llm_manager
 cd llm_manager
 
 # 1. 키를 환경변수로 등록 (새 터미널부터 적용됩니다)
