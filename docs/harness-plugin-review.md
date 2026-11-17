@@ -72,7 +72,7 @@
 
 ```powershell
 git clone --depth 1 --branch v7.0.2 https://github.com/obra/superpowers.git "$HOME\.config\opencode\vendor\superpowers"
-# 오프라인이면 C:\Users\kite7\.claude\plugins\cache\claude-plugins-official\superpowers\7.0.2 를 복사
+# 오프라인이면 C:\Users\<you>\.claude\plugins\cache\claude-plugins-official\superpowers\7.0.2 를 복사
 # (Claude 캐시를 직접 가리키지 말 것 — 업데이트 시 정리됨)
 ```
 
@@ -126,7 +126,7 @@ slim 3.0.7을 시험할 때의 하드닝 예시입니다. 설정 오버레이 �
 - opencode 설정에는 `"plugins": ["oh-my-opencode-slim@3.0.7"]`처럼 **정확히 고정**해 넣습니다.
 - 인스톨러(`bunx … install`)는 가급적 쓰지 마십시오. opencode.json을 수정하고, 기본 에이전트를 끄고, `lsp:true`를 넣습니다. TUI 모드에서는 GitHub star를 묻는 프롬프트도 뜹니다. 꼭 써야 하면 PowerShell에서 `--no-tui --dry-run`으로 미리 보십시오.
 - hermes를 opencode의 @서브에이전트로 쓰려면 slim의 `acpAgents`를 씁니다.
-  - `command`는 **`C:\Users\kite7\.local\bin\hermes.exe`**로 지정합니다. 이 실행 파일은 `acp --check`가 OK입니다.
+  - `command`는 **`C:\Users\<you>\.local\bin\hermes.exe`**로 지정합니다. 이 실행 파일은 `acp --check`가 OK입니다.
   - PATH에서 먼저 잡히는 `%LOCALAPPDATA%\hermes\bin\hermes.exe`는 pydantic_core 오류로 실패합니다.
   - `acp_run`에 `model`을 넘기지 마십시오. hermes가 model configOption을 노출하지 않습니다.
   - 실제 승인 통제는 hermes 쪽 approvals입니다. slim의 `permissionMode: "reject"`는 hermes가 요청한 permission에만 적용됩니다.
@@ -330,7 +330,7 @@ hermes delegation config --show      # 실제 콘솔(TTY)에서
 - 중간: opencode2 오케스트레이터 후보들의 2.0.26 실동작, hermes 플러그인의 버전 경계.
 
 **주요 근거 위치**
-- 로컬: `C:\Users\kite7\AppData\Roaming\uv\tools\hermes-agent\Lib\site-packages\hermes_cli\{plugins.py,plugins_manifest.py,plugins_content.py,plugins_cmd_catalog.py}`, `...\plugin-catalog\*.yaml`, `C:\Users\kite7\.config\opencode\{opencode.json,opencode.jsonc,cli.json,package.json}`, `C:\Users\kite7\.omo\omo.jsonc`, `C:\Users\kite7\.omo\agent\omo-senpi\posthog\`, `D:\work\llm_manager\llm_manager.py`(render_opencode 253-306, render_hermes 393-424, merge 599-640)
+- 로컬: `C:\Users\<you>\AppData\Roaming\uv\tools\hermes-agent\Lib\site-packages\hermes_cli\{plugins.py,plugins_manifest.py,plugins_content.py,plugins_cmd_catalog.py}`, `...\plugin-catalog\*.yaml`, `C:\Users\<you>\.config\opencode\{opencode.json,opencode.jsonc,cli.json,package.json}`, `C:\Users\<you>\.omo\omo.jsonc`, `C:\Users\<you>\.omo\agent\omo-senpi\posthog\`, `D:\work\llm_manager\llm_manager.py`(render_opencode 253-306, render_hermes 393-424, merge 599-640)
 - 웹 (opencode): https://opencode.ai/v2/docs/build/plugins , https://opencode.ai/v2/docs/build/plugins/migrate-v1 , https://opencode.ai/docs/permissions
 - 웹 (OmO 계열): https://github.com/code-yeongyu/oh-my-openagent (#8485, #9389, #10439) , https://github.com/alvinunreal/oh-my-opencode-slim (v3.0.7 docs, PR #1902)
 - 웹 (hermes 계열): https://github.com/obra/superpowers , https://github.com/NousResearch/hermes-official-plugins , https://github.com/rlaope/oh-my-hermes , https://github.com/100yenadmin/hermes-teammates
