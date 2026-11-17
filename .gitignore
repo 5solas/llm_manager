@@ -1,0 +1,10 @@
+# real gateway address and model list stay local
+catalog.yaml
+discovered.json
+
+out/
+backups/
+
+__pycache__/
+.pytest_cache/
+.venv/

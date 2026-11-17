@@ -1,0 +1,65 @@
+# Copy this file to catalog.yaml and fill in real values.
+# catalog.yaml is ignored by git, so the gateway address and model list stay on your PC.
+
+endpoints:
+  corp:                                      # short name; becomes the provider id in every tool
+    base_url: https://llm-gateway.example.com   # gateway root, with or without /v1
+    key_env: COMPANY_LLM_KEY                 # NAME of the environment variable holding your key
+
+# Run `uv run llm_manager.py discover` to get this block from the gateway.
+models:
+  claude-opus-example:
+    family: claude          # claude | gpt | gemini | open   (Claude Code only uses claude)
+    context: 200000         # context window in tokens (hermes needs 64000 or more)
+    max_output: 32000
+    reasoning: true
+    tools: true
+    vision: true
+  claude-sonnet-example: {family: claude, context: 200000, max_output: 32000, reasoning: true, vision: true}
+  claude-haiku-example:  {family: claude, context: 200000, max_output: 16000, vision: true}
+  gpt-example:           {family: gpt,    context: 400000, max_output: 32000, reasoning: true, vision: true}
+  gemini-flash-example:  {family: gemini, context: 1000000, max_output: 32000, vision: true}
+  qwen-coder-example:    {family: open,   context: 131072, max_output: 16000}
+
+# Strongest models first. omo walks each list in order as a fallback chain.
+tiers:
+  tier1: [claude-opus-example, gpt-example]
+  tier2: [claude-sonnet-example, qwen-coder-example]
+  tier3: [claude-haiku-example, gemini-flash-example]
+
+default: claude-sonnet-example   # model every tool starts on
+
+policy:
+  telemetry: false      # false = turn off telemetry and other non-essential outbound traffic
+  auto_update: false    # false = tools do not update themselves
+  external_web: true    # false = turn off web search/fetch tools and omo's built-in context7/grep_app
+  approvals: "off"      # "off" = run commands without asking, "ask" = confirm first
+
+# Everything below is optional.
+
+# tools: {opencode: true, omo: true, hermes: true, claude_code: true}
+
+# omo_roles:                      # which tier each omo agent/category uses
+#   concurrency: 4
+#   categories:
+#     ultrabrain: {tier: tier1, reasoning: max}
+#     quick: tier3
+
+# claude_code:                    # defaults: first Claude model of tier1/2/3
+#   model: claude-sonnet-example
+#   opus: claude-opus-example
+#   sonnet: claude-sonnet-example
+#   haiku: claude-haiku-example
+#   key_env: ANTHROPIC_AUTH_TOKEN
+
+# mcp:                            # installed into all four tools
+#   internal-docs:
+#     url: https://mcp.example.com/mcp
+#     headers: {Authorization: "Bearer ..."}
+#   filesystem:
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"]
+
+# extra:                          # merged as-is into that tool's generated config
+#   omo: {git_master: {include_co_authored_by: false}}
+#   hermes: {agent: {max_turns: 150}}
