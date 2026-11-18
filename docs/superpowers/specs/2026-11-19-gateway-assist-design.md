@@ -30,7 +30,7 @@
 4. LLM에 JSON으로 후보 최대 3개를 요청한다:
    `{"candidates": [{"api": "openai-chat|openai-responses|anthropic-messages|azure-openai", "auth": "bearer|api-key|x-api-key|none", "api_base": "/openai/v1", "query": {"api-version": "..."}, "extra_headers": ["X-Tenant-Id"], "reason": "..."}]}`
    형식이 틀린 답은 버린다.
-5. 검증: 각 후보로 `<api_base>/models`(쿼리 포함)를 실제 호출해 200 + 모델 목록이면 `verified`. 값이 필요한 추가 헤더는 값을 추측하지 않고 `needs value`로 표시하고, 같은 이름의 환경변수가 있으면 그 값으로 검증한다.
+5. 검증: 각 후보로 `<api_base>/models`(쿼리 포함)를 실제 호출해 200 + 모델 목록이면 `verified`. 값이 필요한 추가 헤더는 값을 추측하지 않고 `needs value`로 표시하고, `LLM_HEADER_` + 헤더 이름 환경변수(예: `X-Tenant-Id` → `LLM_HEADER_X_TENANT_ID`)가 있으면 그 값으로 검증한다. 접두어는 LLM이 고른 헤더 이름으로 `DATABASE_URL` 같은 무관한 환경변수가 읽혀 게이트웨이로 전송되는 것을 막는다(구현 중 리뷰에서 변경).
 6. 출력: 후보별 `verified` / `failed` / `needs value`와 이유, 그리고 검증된 후보의 endpoint 설정 예시. `discovered.json`에도 저장한다.
 
 ## 설정
