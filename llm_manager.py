@@ -1026,8 +1026,14 @@ ASSIST_SCHEMA = {
     "required": ["candidates"],
     "additionalProperties": False,
 }
-HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+HEADER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")  # used with fullmatch: no trailing newline
 CREDENTIAL_HEADERS = SECRET_HEADERS | {"x-goog-api-key", "anthropic-api-key"}
+# An extra header's name picks the env var whose value is sent (header_env_name), so names that look like
+# they point at a secret (OPENAI_API_KEY, GITHUB_TOKEN, ...) are refused, as are routing/hop-by-hop headers.
+SECRET_NAME_PARTS = ("key", "token", "secret", "auth", "pass", "pwd", "cookie", "session", "credential", "private")
+RESERVED_HEADERS = frozenset(("host", "content-length", "transfer-encoding", "connection", "keep-alive", "te",
+                              "trailer", "upgrade", "expect", "forwarded", "x-forwarded-for", "x-forwarded-host",
+                              "x-forwarded-proto", "x-real-ip"))
 API_BASE_BAD = re.compile(r"[\s\x00-\x1f\x7f?#\\]")
 
 
@@ -1073,10 +1079,12 @@ def _check_candidate(c, n: int, problems: list[str]) -> dict | None:
         return None
     kept = []
     for h in headers:
-        if not isinstance(h, str) or not HEADER_NAME_RE.match(h):
+        if not isinstance(h, str) or not HEADER_NAME_RE.fullmatch(h):
             problems.append(f"{where}: dropped malformed header name {h!r}")
-        elif h.lower() in CREDENTIAL_HEADERS:
+        elif h.lower() in CREDENTIAL_HEADERS or any(p in h.lower() for p in SECRET_NAME_PARTS):
             problems.append(f"{where}: dropped credential header {h!r}")
+        elif h.lower() in RESERVED_HEADERS or h.lower().startswith("proxy-"):
+            problems.append(f"{where}: dropped routing header {h!r}")
         elif h not in kept:
             kept.append(h)
     return {"api": c["api"], "auth": c["auth"], "api_base": base.rstrip("/"),

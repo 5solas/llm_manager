@@ -823,10 +823,20 @@ def test_parse_candidates_rejects_foreign_hosts():
 
 
 def test_parse_candidates_drops_credential_and_malformed_headers():
-    headers = ["Authorization", "api-key", "Cookie", "X Bad", "X-Ok\r\nY: z", "X-Tenant-Id"]
+    headers = ["Authorization", "api-key", "Cookie", "X Bad", "X-Ok\r\nY: z", "X-Tenant-Id\n", "X-Tenant-Id"]
     cands, probs = lm.parse_candidates({"candidates": [cand(extra_headers=headers)]})
     assert cands[0]["extra_headers"] == ["X-Tenant-Id"]
-    assert len(probs) == 5
+    assert len(probs) == 6
+
+
+def test_parse_candidates_drops_secret_named_and_routing_headers():
+    # the header name picks the env var whose value is sent, so names that point at secrets are refused
+    headers = ["Openai-Api-Key", "Github-Token", "Aws-Secret-Access-Key", "X-Db-Password", "X-Session-Id",
+               "X-Credentials", "Proxy-Authorization", "Host", "content-length", "Transfer-Encoding",
+               "Connection", "Proxy-Foo", "X-Tenant-Id", "Ocp-Apim-Trace"]
+    cands, probs = lm.parse_candidates({"candidates": [cand(extra_headers=headers)]})
+    assert cands[0]["extra_headers"] == ["X-Tenant-Id", "Ocp-Apim-Trace"]
+    assert len(probs) == 12
 
 
 def test_header_env_name():
