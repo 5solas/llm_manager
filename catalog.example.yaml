@@ -5,8 +5,28 @@ endpoints:
   corp:                                      # short name; becomes the provider id in every tool
     base_url: https://llm-gateway.example.com   # gateway root, with or without /v1
     key_env: COMPANY_LLM_KEY                 # NAME of the environment variable holding your key
+    # kind: litellm                          # optional: litellm | vllm | ollama | azure-openai | anthropic | openai-compatible
+    # auth: bearer                           # optional: bearer (default) | api-key | x-api-key | none
+    # api_base: /v1                          # optional: API path under root (default: /v1; /openai/v1 or "" allowed)
+    # api: openai-completions                # optional: openai-completions (default) | openai-responses | anthropic-messages
+    # headers: {X-Team: platform}            # optional: extra static HTTP headers for this endpoint
+    # concurrency: 4                         # optional: per-endpoint limit (omo task.provider_concurrency)
+
+  # Optional extra endpoints (run `uv run llm_manager.py detect` to generate ready-to-paste entries):
+  # local:
+  #   base_url: http://127.0.0.1:8000
+  #   kind: vllm
+  #   auth: none                             # keyless server: key_env is not required
+  #   concurrency: 2
+  # azure:
+  #   base_url: https://my-resource.openai.azure.com/openai/v1
+  #   key_env: AZURE_OPENAI_KEY
+  #   kind: azure-openai
+  #   auth: api-key
+  #   api_base: /openai/v1
 
 # Run `uv run llm_manager.py discover` to get this block from the gateway.
+# With 2+ endpoints, each model must specify `endpoint: <name>` (and may override `api:`).
 models:
   claude-opus-example:
     family: claude          # claude | gpt | gemini | open   (Claude Code only uses claude)
@@ -45,7 +65,8 @@ policy:
 #     ultrabrain: {tier: tier1, reasoning: max}
 #     quick: tier3
 
-# claude_code:                    # defaults: first Claude model of tier1/2/3
+# claude_code:                    # Claude Code uses one endpoint; defaults to the first Claude model's endpoint
+#   endpoint: corp
 #   model: claude-sonnet-example
 #   opus: claude-opus-example
 #   sonnet: claude-sonnet-example
@@ -60,6 +81,6 @@ policy:
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"]
 
-# extra:                          # merged as-is into that tool's generated config
+# extra:                          # merged last into that tool's generated config (can override providers/fallback_providers)
 #   omo: {git_master: {include_co_authored_by: false}}
 #   hermes: {agent: {max_turns: 150}}
