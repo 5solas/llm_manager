@@ -925,11 +925,76 @@ def kind_from_host(url: str) -> str | None:
     return next((kind for pattern, kind in HOST_KINDS if re.search(pattern, host)), None)
 
 
+PROBE_BODY_MAX = 500
+OPENAPI_MAX_PATHS = 60
+SECRET_HEADERS = frozenset(("set-cookie", "cookie", "authorization", "api-key", "x-api-key", "proxy-authorization"))
+
+
+def redact(text: str, key: str | None) -> str:
+    """Replace the key (when at least 4 characters) with <key>, also in its JSON-escaped spelling."""
+    if not key or len(key) < 4:
+        return text
+    text = text.replace(key, "<key>")
+    escaped = json.dumps(key)[1:-1]
+    return text.replace(escaped, "<key>") if escaped != key else text
+
+
+def openapi_summary(body) -> dict | None:
+    """Path list and security schemes of an OpenAPI (or Swagger 2) document, or None if body is not one."""
+    if not isinstance(body, dict) or not isinstance(body.get("paths"), dict):
+        return None
+    schemes = (body.get("components") or {}).get("securitySchemes") if isinstance(body.get("components"), dict) else None
+    if schemes is None:
+        schemes = body.get("securityDefinitions")
+    return {"paths": [str(p) for p in body["paths"]][:OPENAPI_MAX_PATHS],
+            "security_schemes": schemes if isinstance(schemes, dict) else {}}
+
+
+def _scrub(value, key: str | None):
+    if isinstance(value, str):
+        return redact(value, key)
+    if isinstance(value, dict):
+        return {_scrub(str(k), key): _scrub(v, key) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(v, key) for v in value]
+    return value
+
+
+def build_evidence(det: dict, key: str | None) -> dict:
+    """What a judge may see about one endpoint: no key, no cookies, no credential headers, capped bodies."""
+    probes = []
+    for p in det.get("probes") or []:
+        probes.append({"method": p.get("method"), "path": p.get("path"), "auth": p.get("auth"),
+                       "status": p.get("status"),
+                       "headers": {str(k).lower(): v for k, v in (p.get("headers") or {}).items()
+                                   if str(k).lower() not in SECRET_HEADERS},
+                       "body": str(p.get("body") or "")[:PROBE_BODY_MAX]})
+    ev = _scrub({"root": det.get("root"), "kind": det.get("kind"), "auth": det.get("auth"),
+                 "api_base": det.get("api_base"), "warnings": det.get("warnings") or [],
+                 "probes": probes, "openapi": det.get("openapi")}, key)
+    for p in ev["probes"]:
+        p["body"] = p["body"][:PROBE_BODY_MAX]  # redaction can shift length; cap again
+    if key and len(key) >= 4 and key in json.dumps(ev, ensure_ascii=False):
+        raise ValueError("evidence still contains the key after redaction")
+    return ev
+
+
 def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:
     """Work out what kind of LLM server sits at url, which auth header it takes and where its API lives."""
     root = endpoint_root(url)
     res = {"root": root, "kind": None, "auth": None, "api_base": None,
-           "evidence": [], "warnings": [], "renderable": False, "model_ids": []}
+           "evidence": [], "warnings": [], "renderable": False, "model_ids": [],
+           "probes": [], "openapi": None}
+
+    def probe(path: str, auth: str):
+        """One GET, recorded in res["probes"] (key redacted, credential headers left out)."""
+        status, body, headers = http_call(root + path, key, timeout=timeout, auth=auth)
+        text = body if isinstance(body, str) else json.dumps(body)
+        res["probes"].append({"method": "GET", "path": path, "auth": auth, "status": status,
+                              "headers": {k: redact(str(v), key) for k, v in headers.items()
+                                          if k not in SECRET_HEADERS},
+                              "body": redact(text, key)[:PROBE_BODY_MAX]})
+        return status, body, headers
     host_kind = kind_from_host(root)
     if host_kind:
         res["evidence"].append(f"host name looks like {host_kind}")
@@ -944,7 +1009,7 @@ def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:
     found = None
     for base in MODEL_LIST_BASES:
         for auth in (AUTH_STYLES if key else ("none",)):
-            status, body, headers = http_call(root + base + "/models", key, timeout=timeout, auth=auth)
+            status, body, headers = probe(base + "/models", auth)
             if status is None:
                 res["kind"] = "unreachable"
                 res["evidence"].append(f"{root}: {body}")
@@ -966,10 +1031,14 @@ def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:
     for path, name, test in (("/model_group/info", "litellm", lambda b: isinstance(b.get("data"), list)),
                              ("/api/tags", "ollama", lambda b: isinstance(b.get("models"), list)),
                              ("/version", "vllm", lambda b: isinstance(b.get("version"), str))):
-        status, body, headers = http_call(root + path, key, timeout=timeout, auth=probe_auth)
+        status, body, headers = probe(path, probe_auth)
         seen_headers.update(headers)
         if status == 200 and isinstance(body, dict) and test(body):
             fingerprints[name] = f"{path} answers like {name}"
+    status, body, headers = probe("/openapi.json", probe_auth)
+    seen_headers.update(headers)
+    if status == 200:
+        res["openapi"] = openapi_summary(body)
 
     names = list(seen_headers)
     if any(h.startswith("x-litellm") for h in names):

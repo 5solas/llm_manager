@@ -707,3 +707,53 @@ def test_key_helper_script_prints_only_the_key(monkeypatch):
     monkeypatch.delenv("LLM_MANAGER_TEST_KEY")
     missing = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     assert missing.returncode != 0 and missing.stdout == "" and "LLM_MANAGER_TEST_KEY" in missing.stderr
+
+
+# ---- assist: evidence
+
+def test_detect_records_each_probe():
+    routes = {"/openai/v1/models": (200, {"data": [{"id": "gpt-4o"}]}, {"apim-request-id": "abc"})}
+    with fake_server(routes, need=("api-key", "k")) as (url, _):
+        det = lm.detect_server(url, "k")
+    assert any(p["path"] == "/openai/v1/models" and p["auth"] == "api-key" and p["status"] == 200
+               for p in det["probes"])
+    assert any(p["status"] == 401 for p in det["probes"])
+    assert all(p["method"] == "GET" for p in det["probes"])
+
+
+def test_detect_summarizes_openapi():
+    schemes = {"tenant": {"type": "apiKey", "in": "header", "name": "X-Tenant-Id"}}
+    spec = {"paths": {"/v2/chat": {}, "/v2/models": {}}, "components": {"securitySchemes": schemes}}
+    with fake_server({"/openapi.json": (200, spec, {})}) as (url, _):
+        det = lm.detect_server(url, "k")
+    assert det["openapi"] == {"paths": ["/v2/chat", "/v2/models"], "security_schemes": schemes}
+
+
+def test_evidence_never_contains_the_key():
+    routes = {"/v1/models": (401, {"error": "bad key sk-leak-123"},
+                             {"X-Debug": "sk-leak-123", "Set-Cookie": "s=1"})}
+    with fake_server(routes) as (url, _):
+        det = lm.detect_server(url, "sk-leak-123")
+    text = json.dumps(lm.build_evidence(det, "sk-leak-123"))
+    assert "sk-leak-123" not in text and "<key>" in text
+    assert all("set-cookie" not in p["headers"] for p in lm.build_evidence(det, "sk-leak-123")["probes"])
+    # build_evidence scrubs on its own too, whatever detect_server recorded
+    det["probes"].append({"method": "GET", "path": "/x", "auth": "bearer", "status": 401,
+                          "headers": {"Authorization": "Bearer sk-leak-123", "x-echo": "sk-leak-123"},
+                          "body": "sk-leak-123"})
+    ev = lm.build_evidence(det, "sk-leak-123")
+    assert "sk-leak-123" not in json.dumps(ev)
+    assert "authorization" not in {h.lower() for h in ev["probes"][-1]["headers"]}
+
+
+def test_evidence_bodies_are_capped():
+    with fake_server({"/v1/models": (401, "x" * 2000, {})}) as (url, _):
+        det = lm.detect_server(url, "k")
+    ev = lm.build_evidence(det, "k")
+    assert ev["probes"] and all(len(p["body"]) <= 500 for p in ev["probes"])
+
+
+def test_redact_short_key_is_left_alone():
+    assert lm.redact("abc sk-1234 abc", "sk-1234") == "abc <key> abc"
+    assert lm.redact("abc", "abc") == "abc"
+    assert lm.redact("abc", None) == "abc"
