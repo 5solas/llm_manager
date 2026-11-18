@@ -60,6 +60,11 @@ policy:
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"]
 
+# assist:                         # used by detect/discover --assist; without it they ask Claude Code
+#   base_url: https://llm-gateway.example.com   # OpenAI-compatible chat completions, Bearer auth
+#   key_env: ASSIST_LLM_KEY       # NAME of the environment variable holding that API's key
+#   model: some-strong-model
+
 # extra:                          # merged as-is into that tool's generated config
 #   omo: {git_master: {include_co_authored_by: false}}
 #   hermes: {agent: {max_turns: 150}}

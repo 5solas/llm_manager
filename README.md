@@ -74,6 +74,34 @@ uv run llm_manager.py verify
 uv run llm_manager.py detect --url https://llm-gateway.example.com --key-env COMPANY_LLM_KEY
 ```
 
+### LLM 판단 지원 (`--assist`)
+
+규칙 점검으로 연결 형식을 정하지 못한 endpoint는 LLM에게 판단을 맡길 수 있습니다. `detect`와 `discover`에 `--assist`를 붙였을 때만 동작하고, `build`/`diff`/`apply`/`verify`의 점검에서는 LLM을 부르지 않습니다.
+
+```powershell
+uv run llm_manager.py detect --assist          # auto
+uv run llm_manager.py discover --assist api    # catalog.yaml의 assist: 블록 사용
+uv run llm_manager.py detect --assist claude   # 설치된 Claude Code 사용
+```
+
+- 언제 부르나: 서버 종류가 `unknown`이거나, 키가 모든 인증 방식에서 거부됐거나, 생성되는 설정이 바로 쓸 수 없는 형식일 때(Bearer + `<base_url>/v1`이 아닐 때)만 부릅니다. 이미 정상인 endpoint, 접속이 안 되는 endpoint, Bedrock·Vertex는 부르지 않습니다.
+- 누구에게 묻나:
+  - `api`: `catalog.yaml`의 `assist:` 블록에 적은 API (OpenAI 호환 chat completions, Bearer 인증). 점검 대상과 따로 동작하므로 모든 endpoint가 막혀 있어도 쓸 수 있습니다.
+  - `claude`: 설치된 Claude Code를 `claude -p`로 한 번 호출합니다. 도구·MCP·프로젝트 설정 없이 빈 임시 폴더에서 실행합니다.
+  - `auto`(기본): `assist:` 블록이 있으면 `api`, 없으면 `claude`. 단 Claude Code가 게이트웨이를 쓸 때(`ANTHROPIC_BASE_URL` 설정됨)만 `claude`를 고릅니다. Anthropic에 직접 연결된 Claude Code에 사내 응답 정보를 보내려면 `--assist claude`로 명시해야 하고, 이때 경고를 출력합니다.
+- 무엇을 보내나: 점검 때 보낸 요청(메서드, 경로, 인증 방식 이름, 상태 코드), 응답 헤더(쿠키·인증 헤더 제외), 응답 본문 앞 500자, `/openapi.json`이 있으면 경로 목록과 `securitySchemes`. **키 값은 보내지 않습니다.** 모든 텍스트에서 키를 `<key>`로 바꾸고, 보내기 직전에 키가 남아 있는지 다시 검사합니다.
+- 결과: LLM이 제안한 후보(최대 3개)마다 `<api_base>/models`를 실제로 호출해 확인하고 상태를 붙입니다.
+  - `verified`: 실제 요청이 성공했습니다. 붙여 넣을 수 있는 endpoint 설정 예시를 함께 출력합니다.
+  - `failed`: 실제 요청이 실패했습니다 (HTTP 상태와 이유 표시).
+  - `needs value`: 추가 헤더(예: `X-Tenant-Id`)가 필요한데 값이 없습니다. 값은 추측하지 않고 `LLM_HEADER_` + 헤더 이름(대문자, 영숫자 외 문자는 `_`) 환경변수에서만 읽습니다. 예: `X-Tenant-Id` → `LLM_HEADER_X_TENANT_ID`. 값을 넣고 다시 실행하면 그 값으로 확인합니다.
+
+  ```powershell
+  $env:LLM_HEADER_X_TENANT_ID = "my-tenant"
+  ```
+
+- 결과는 제안일 뿐이며 `catalog.yaml`은 고치지 않습니다. `discover --assist`는 결과를 `discovered.json`에도 저장합니다.
+- 판단 API에 접속이 안 되거나, 시간이 초과되거나, `claude`가 설치돼 있지 않으면 한 줄로 알리고 점검 결과는 그대로 출력합니다.
+
 ## 무엇이 설치되나
 
 | 툴 | 파일 | 방식 |

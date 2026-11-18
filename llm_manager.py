@@ -1434,8 +1434,102 @@ def print_detection(name: str, det: dict) -> None:
         print(f"  warning: {item}")
 
 
-def cmd_detect(targets: list[tuple[str, str, str | None]]) -> dict:
-    """targets: (name, base_url, key_env). Prints what each server is; never prints a key."""
+def needs_assist(det: dict) -> bool:
+    """Whether a judge could add anything: rules found no usable format. Unreachable and cloud-signed servers
+    have nothing to learn from (no answers to read, or a signing scheme no candidate can express)."""
+    if det.get("kind") in ("unreachable", *CLOUD_SIGNED):
+        return False
+    return det.get("kind") == "unknown" or not det.get("renderable")
+
+
+def assist_endpoint(det: dict, key: str | None, judge) -> dict:
+    """Ask the judge about one endpoint and verify each candidate it proposes with a real request.
+
+    Returns {"judge_reason", "problems", "candidates"}; judge_reason is why the judge gave no answer ("" if it did).
+    Never raises: a broken judge or answer is reported so the other endpoints are still processed."""
+    result = {"judge_reason": "", "problems": [], "candidates": []}
+    try:
+        evidence = build_evidence(det, key)
+        payload, reason = judge(evidence)
+    except Exception as exc:  # noqa: BLE001 - one endpoint's judge failure must not stop the others
+        result["judge_reason"] = redact(f"judge failed: {type(exc).__name__}: {exc}", key)[:300]
+        return result
+    if payload is None:
+        result["judge_reason"] = redact(str(reason or "the judge gave no answer"), key)
+        return result
+    cands, problems = parse_candidates(payload)
+    result["problems"] = [redact(p, key) for p in problems]
+    result["candidates"] = [verify_candidate(det["root"], key, {**c, "reason": redact(c["reason"], key)})
+                            for c in cands]
+    return result
+
+
+def _candidate_path(cand: dict) -> str:
+    query = cand.get("query") or {}
+    return (cand.get("api_base") or "/") + ("?" + urllib.parse.urlencode(query) if query else "")
+
+
+def print_assist(name: str, result: dict) -> None:
+    """One line per candidate, plus a catalog endpoint block for each verified one.
+
+    result may also carry "root" and "key_env" (the endpoint's), used in that block."""
+    if result.get("judge_reason"):
+        print(f"  assist: no answer - {result['judge_reason']}")
+    for problem in result.get("problems") or []:
+        print(f"  assist: ignored part of the answer - {problem}")
+    if not result.get("judge_reason") and not result.get("candidates"):
+        print("  assist: the judge proposed no usable connection format")
+    for c in result.get("candidates") or []:
+        line = f"  assist: [{c['status']}] {c['api']}, {AUTH_LABELS[c['auth']]}, {_candidate_path(c)}"
+        line += f" - {c['reason'] or 'no reason given'}"
+        if c.get("detail"):
+            line += f" ({c['detail']})"
+        print(line)
+        if c["status"] != "verified":
+            continue
+        block = {"base_url": (result.get("root") or "<base_url>") + c["api_base"],
+                 "key_env": result.get("key_env") or "<KEY_ENV>", "api": c["api"], "auth": c["auth"]}
+        if c.get("query"):
+            block["query"] = dict(c["query"])
+        if c.get("extra_headers"):
+            block["headers"] = {h: "${" + header_env_name(h) + "}" for h in c["extra_headers"]}
+        print("    suggested endpoint (catalog.yaml endpoints:):")
+        text = yaml.safe_dump({name: block}, sort_keys=False, allow_unicode=True, default_flow_style=False)
+        print("\n".join("      " + line for line in text.rstrip().splitlines()))
+
+
+class _Assist:
+    """Runs the judge for the endpoints that need it; the judge is chosen on first use, so nothing is printed
+    and nothing is asked when every endpoint already works."""
+
+    def __init__(self, mode: str | None, raw: dict | None, claude_dir: Path | None):
+        self.mode, self.raw, self.claude_dir = mode, raw or {}, claude_dir
+        self.chosen = False
+        self.judge = None
+
+    def __call__(self, name: str, det: dict, key: str | None, key_env: str | None) -> dict | None:
+        if not self.mode or not needs_assist(det):
+            return None
+        if not self.chosen:
+            self.chosen = True
+            claude_dir = self.claude_dir if self.claude_dir is not None else tool_dirs(None)["claude"]
+            _, self.judge, messages = choose_judge(self.mode, self.raw, claude_dir)
+            for message in messages:
+                print(message)
+        if self.judge is None:
+            return None
+        result = {**assist_endpoint(det, key, self.judge), "root": det["root"], "key_env": key_env}
+        print_assist(name, result)
+        return result
+
+
+def cmd_detect(targets: list[tuple[str, str, str | None]], assist_mode: str | None = None,
+               raw: dict | None = None, claude_dir: Path | None = None) -> dict:
+    """targets: (name, base_url, key_env). Prints what each server is; never prints a key.
+
+    assist_mode (auto/api/claude) asks a judge about endpoints the rules could not settle (raw holds the
+    catalog's assist: block); those results gain "assist"."""
+    assist = _Assist(assist_mode, raw, claude_dir)
     results = {}
     for name, url, key_env in targets:
         key = os.environ.get(key_env or "")
@@ -1443,6 +1537,9 @@ def cmd_detect(targets: list[tuple[str, str, str | None]]) -> dict:
             print(f"warning: environment variable {key_env} is not set; probing {name} without a key")
         results[name] = detect_server(url, key)
         print_detection(name, results[name])
+        found = assist(name, results[name], key, key_env)
+        if found is not None:
+            results[name]["assist"] = found
     return results
 
 
@@ -1492,15 +1589,20 @@ def models_yaml(endpoint: str, models: dict) -> str:
     return yaml.safe_dump({"models": block}, sort_keys=False, allow_unicode=True)
 
 
-def cmd_discover(raw: dict, out_file: Path, probe_model: str | None) -> dict:
+def cmd_discover(raw: dict, out_file: Path, probe_model: str | None, assist_mode: str | None = None,
+                 claude_dir: Path | None = None) -> dict:
+    """assist_mode: as in cmd_detect; the judge's verified candidates are printed and saved under "assist"."""
+    assist = _Assist(assist_mode, raw, claude_dir)
     results = {}
     for name, ep in (raw.get("endpoints") or {}).items():
+        ep = ep or {}
         root = endpoint_root(ep.get("base_url"))
         key = os.environ.get(ep.get("key_env") or "")
         if not key:
             print(f"warning: environment variable {ep.get('key_env')} is not set; calling {name} without a key")
         det = detect_server(root, key)
         print_detection(name, det)
+        found = assist(name, det, key, ep.get("key_env"))
         if det["kind"] in ("unreachable", *CLOUD_SIGNED):
             results[name] = {"root": root, "server": det}
             print(f"  skipped model discovery for {name}\n")
@@ -1508,6 +1610,8 @@ def cmd_discover(raw: dict, out_file: Path, probe_model: str | None) -> dict:
         res = discover_endpoint(root, key, probe_model, auth=det["auth"] or "bearer",
                                 api_base="/v1" if det["api_base"] is None else det["api_base"])
         res["server"] = det
+        if found is not None:
+            res["assist"] = found
         results[name] = res
         for src, status in res["sources"].items():
             print(f"  {src}: {status}")
@@ -1555,6 +1659,13 @@ def cmd_verify(cat: dict) -> int:
     return failures
 
 
+def add_assist_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--assist", nargs="?", const="auto", choices=["auto", "api", "claude"],
+                   help="ask an LLM about endpoints the rules cannot settle and verify its suggestions: api = the "
+                        "catalog's assist: block, claude = the installed Claude Code, auto (default) = assist: if "
+                        "present, else Claude Code when it is on a gateway")
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -1564,6 +1675,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("discover", help="query the gateway for models and supported API formats")
     p.add_argument("--probe-model", help="model used to test the API formats (default: first model found)")
+    add_assist_flag(p)
     for name, text in (("build", "render configs into out/ for review"),
                        ("diff", "show what apply would change"),
                        ("apply", "back up and install the configs")):
@@ -1577,6 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("detect", help="identify each gateway's server type, auth header and API path")
     p.add_argument("--url", help="probe this address instead of the catalog endpoints (no catalog needed)")
     p.add_argument("--key-env", help="with --url: name of the environment variable holding the key")
+    add_assist_flag(p)
     sub.add_parser("verify", help="check tools, keys and the gateway")
     args = parser.parse_args(argv)
 
@@ -1585,11 +1698,14 @@ def main(argv: list[str] | None = None) -> int:
             if not args.catalog.exists():
                 raise CatalogError([f"{args.catalog} not found - copy catalog.example.yaml to catalog.yaml first"])
             raw = yaml.safe_load(args.catalog.read_text(encoding="utf-8")) or {}
-            cmd_discover(raw, ROOT / "discovered.json", args.probe_model)
+            cmd_discover(raw, ROOT / "discovered.json", args.probe_model, args.assist, tool_dirs(None)["claude"])
             return 0
         if args.command == "detect":
+            raw = {}
             if args.url:
                 targets = [("url", args.url, args.key_env)]
+                if args.assist and args.catalog.exists():  # only for its assist: block
+                    raw = yaml.safe_load(args.catalog.read_text(encoding="utf-8")) or {}
             else:
                 if not args.catalog.exists():
                     raise CatalogError([f"{args.catalog} not found - copy catalog.example.yaml to catalog.yaml "
@@ -1597,7 +1713,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw = yaml.safe_load(args.catalog.read_text(encoding="utf-8")) or {}
                 targets = [(n, (ep or {}).get("base_url"), (ep or {}).get("key_env"))
                            for n, ep in (raw.get("endpoints") or {}).items()]
-            found = cmd_detect(targets)
+            found = cmd_detect(targets, args.assist, raw, tool_dirs(None)["claude"] if args.assist else None)
             return 1 if any(d["kind"] in ("unreachable", "unknown") for d in found.values()) else 0
         cat = load_catalog(args.catalog)
         if args.command in ("build", "diff", "apply") and not args.skip_check:

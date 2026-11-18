@@ -1113,3 +1113,152 @@ def test_assist_config_problems():
     assert cfg is None and probs
     cfg, probs = lm.assist_config({"assist": {"base_url": "https://judge.example/v1/", "key_env": "K", "model": "m"}})
     assert probs == [] and cfg == {"root": "https://judge.example", "key_env": "K", "model": "m"}
+
+
+# ---- assist: command
+
+TARGET_KEY = "sk-corp-target-1"
+AZURE_ROUTES = {"/openai/v1/models": (200, {"data": [{"id": "gpt-4o"}]}, {"apim-request-id": "abc"})}
+AZURE_CAND = {"api": "azure-openai", "auth": "api-key", "api_base": "/openai/v1", "query": {},
+              "extra_headers": [], "reason": "apim-request-id header and /openai/v1/models answers"}
+
+
+def judge_answer(*cands) -> dict:
+    return {"choices": [{"message": {"content": json.dumps({"candidates": list(cands)})}}]}
+
+
+def assist_catalog(tmp_path, target: str, judge: str | None = None) -> Path:
+    raw = {"endpoints": {"corp": {"base_url": target, "key_env": "CORP_KEY"}}}
+    if judge:
+        raw["assist"] = {"base_url": judge, "key_env": "ASSIST_KEY", "model": "judge-1"}
+    path = tmp_path / "catalog.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def assist_env(tmp_path, monkeypatch):
+    """Target and judge keys set; Claude Code looks off-gateway (no real ~/.claude is read)."""
+    monkeypatch.setenv("CORP_KEY", TARGET_KEY)
+    monkeypatch.setenv("ASSIST_KEY", "ak")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    claude_dir = tmp_path / "claude-home"
+    monkeypatch.setattr(lm, "tool_dirs", lambda home: {"claude": claude_dir})
+    return claude_dir
+
+
+def test_needs_assist():
+    base = {"kind": "litellm", "renderable": True}
+    assert not lm.needs_assist(base)
+    assert lm.needs_assist({**base, "kind": "unknown", "renderable": False})
+    assert lm.needs_assist({**base, "kind": "azure-openai", "renderable": False})
+    assert not lm.needs_assist({"kind": "unreachable", "renderable": False})
+    assert not lm.needs_assist({"kind": "bedrock", "renderable": False})
+
+
+def test_detect_assist_end_to_end(tmp_path, assist_env, capsys):
+    bodies = []
+    judge_routes = {"/v1/chat/completions": (200, judge_answer(AZURE_CAND), {})}
+    with fake_server(AZURE_ROUTES, need=("api-key", TARGET_KEY)) as (target, _):
+        with fake_server(judge_routes, need=("Authorization", "Bearer ak"), bodies=bodies) as (judge, judge_seen):
+            code = lm.main(["--catalog", str(assist_catalog(tmp_path, target, judge)), "detect", "--assist"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert len(judge_seen) == 1 and TARGET_KEY not in bodies[0]
+    assert "[verified] azure-openai" in out and "api-key: <key>" in out
+    block = out[out.index("[verified]"):]
+    assert "auth: api-key" in block and "api: azure-openai" in block and "key_env: CORP_KEY" in block
+    assert f"base_url: {target}/openai/v1" in block
+    assert TARGET_KEY not in out
+
+
+def test_assist_is_not_called_for_working_endpoint(tmp_path, assist_env, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(lm, "ask_api", lambda cfg, ev, timeout=0: calls.append(ev) or (None, "x"))
+    monkeypatch.setattr(lm, "ask_claude", lambda ev, timeout=0: calls.append(ev) or (None, "x"))
+    with fake_server({"/v1/models": MODELS}, need=("Authorization", f"Bearer {TARGET_KEY}")) as (target, _):
+        code = lm.main(["--catalog", str(assist_catalog(tmp_path, target, "https://judge.example")),
+                        "detect", "--assist"])
+    out = capsys.readouterr().out
+    assert code == 0 and calls == []
+    assert "assist" not in out
+
+
+def test_assist_without_judge_keeps_detection_output(tmp_path, assist_env, capsys):
+    with fake_server({"/v1/models": MODELS}, need=("Authorization", "Bearer right")) as (target, _):
+        path = str(assist_catalog(tmp_path, target))
+        plain = lm.main(["--catalog", path, "detect"])
+        plain_out = capsys.readouterr().out
+        code = lm.main(["--catalog", path, "detect", "--assist"])
+    out = capsys.readouterr().out
+    assert code == plain == 1
+    assert out.startswith(plain_out) and "server:  unknown" in out
+    assert "--assist claude" in out
+
+
+def test_detect_without_assist_flag_never_calls_judge(tmp_path, assist_env, monkeypatch, capsys):
+    monkeypatch.setattr(lm, "ask_api", lambda *a, **k: pytest.fail("ask_api called"))
+    monkeypatch.setattr(lm, "ask_claude", lambda *a, **k: pytest.fail("ask_claude called"))
+    with fake_server(AZURE_ROUTES, need=("api-key", TARGET_KEY)) as (target, _):
+        code = lm.main(["--catalog", str(assist_catalog(tmp_path, target, "https://judge.example")), "detect"])
+    out = capsys.readouterr().out
+    assert code == 0 and "server:  azure-openai" in out and "assist" not in out
+
+
+def test_assist_reports_unusable_answer_and_keeps_going(tmp_path, assist_env, capsys):
+    answer = {"choices": [{"message": {"content": "I am not sure, sorry."}}]}
+    with fake_server(AZURE_ROUTES, need=("api-key", TARGET_KEY)) as (target, _):
+        with fake_server({"/v1/chat/completions": (200, answer, {})}) as (judge, _):
+            raw = yaml.safe_load(assist_catalog(tmp_path, target, judge).read_text(encoding="utf-8"))
+            raw["endpoints"]["second"] = {"base_url": target, "key_env": "CORP_KEY"}
+            res = lm.cmd_detect([(n, ep["base_url"], ep["key_env"]) for n, ep in raw["endpoints"].items()],
+                                assist_mode="auto", raw=raw, claude_dir=assist_env)
+    out = capsys.readouterr().out
+    assert set(res) == {"corp", "second"}
+    for det in res.values():
+        assert det["assist"]["candidates"] == [] and det["assist"]["problems"]
+    assert out.count("no JSON object") == 2 and "[second]" in out
+
+
+def test_assist_endpoint_verifies_and_reports_judge_failure():
+    with fake_server(AZURE_ROUTES, need=("api-key", TARGET_KEY)) as (target, _):
+        det = lm.detect_server(target, TARGET_KEY)
+        bad = dict(AZURE_CAND, auth="bearer", reason="guess")
+        res = lm.assist_endpoint(det, TARGET_KEY, lambda ev: ({"candidates": [AZURE_CAND, bad]}, ""))
+        failed = lm.assist_endpoint(det, TARGET_KEY, lambda ev: (None, "judge timed out"))
+        crashed = lm.assist_endpoint(det, TARGET_KEY, lambda ev: 1 / 0)
+    assert [c["status"] for c in res["candidates"]] == ["verified", "failed"]
+    assert res["judge_reason"] == "" and res["problems"] == []
+    assert failed == {"judge_reason": "judge timed out", "problems": [], "candidates": []}
+    assert crashed["candidates"] == [] and "ZeroDivisionError" in crashed["judge_reason"]
+
+
+def test_print_assist_lines_and_yaml(capsys):
+    result = {"judge_reason": "", "problems": ["candidate 2: unknown api 'x'"], "root": "https://gw", "key_env": "K",
+              "candidates": [
+                  {**AZURE_CAND, "api_base": "/openai", "query": {"api-version": "2024-10-21"},
+                   "extra_headers": ["X-Tenant-Id"], "status": "verified", "detail": "1 models listed"},
+                  {**AZURE_CAND, "auth": "bearer", "status": "failed", "detail": "HTTP 401: nope"}]}
+    lm.print_assist("corp", result)
+    out = capsys.readouterr().out
+    assert "  assist: [verified] azure-openai, api-key: <key>, /openai?api-version=2024-10-21 - apim" in out
+    assert "  assist: [failed] azure-openai, Authorization: Bearer <key>, /openai/v1 - " in out
+    assert "HTTP 401: nope" in out and "unknown api" in out
+    yaml_text = out[out.index("corp:"):out.index("[failed]")].rsplit("\n", 1)[0]
+    block = yaml.safe_load(yaml_text)["corp"]
+    assert block == {"base_url": "https://gw/openai", "key_env": "K", "api": "azure-openai", "auth": "api-key",
+                     "query": {"api-version": "2024-10-21"}, "headers": {"X-Tenant-Id": "${LLM_HEADER_X_TENANT_ID}"}}
+
+
+def test_discover_assist_saves_candidates(tmp_path, assist_env, capsys):
+    routes = {**AZURE_ROUTES, "/openai/v1/chat/completions": (200, {"ok": True}, {})}
+    with fake_server(routes, need=("api-key", TARGET_KEY)) as (target, _):
+        with fake_server({"/v1/chat/completions": (200, judge_answer(AZURE_CAND), {})}) as (judge, _):
+            raw = yaml.safe_load(assist_catalog(tmp_path, target, judge).read_text(encoding="utf-8"))
+            out_file = tmp_path / "discovered.json"
+            res = lm.cmd_discover(raw, out_file, None, assist_mode="api", claude_dir=assist_env)
+    saved_text = out_file.read_text(encoding="utf-8")
+    assert res["corp"]["assist"]["candidates"][0]["status"] == "verified"
+    assert json.loads(saved_text)["corp"]["assist"]["candidates"][0]["status"] == "verified"
+    assert TARGET_KEY not in saved_text
+    assert "[verified]" in capsys.readouterr().out
