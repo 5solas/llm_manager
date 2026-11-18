@@ -1070,18 +1070,26 @@ HEADER_ENV_PREFIX = "LLM_HEADER_"
 HEADER_VALUE_OK = re.compile(r"[\x20-\x7e]+")  # used with fullmatch: printable ASCII, no CR/LF
 
 
-def _first_json_object(text: str):
-    """The first {...} in text that parses as a JSON object (fences and prose around it are ignored)."""
+def _first_json_object(text: str, prefer: str | None = None):
+    """The first {...} in text that parses as a JSON object (fences and prose around it are ignored).
+
+    With prefer, the first object holding that key wins, so an object quoted in the prose before the real
+    answer (a gateway error body, say) is passed over; the first object is the fallback when none holds it."""
     decoder = json.JSONDecoder()
+    first = None
     for i, ch in enumerate(text):
         if ch == "{":
             try:
                 obj, _ = decoder.raw_decode(text, i)
             except ValueError:
                 continue
-            if isinstance(obj, dict):
+            if not isinstance(obj, dict):
+                continue
+            if prefer is None or prefer in obj:
                 return obj
-    return None
+            if first is None:
+                first = obj
+    return first
 
 
 def _check_candidate(c, n: int, problems: list[str]) -> dict | None:
@@ -1128,7 +1136,7 @@ def _check_candidate(c, n: int, problems: list[str]) -> dict | None:
 def parse_candidates(payload: object) -> tuple[list[dict], list[str]]:
     """Validate a judge's answer (a dict, or text holding a JSON object). Returns (at most 3 candidates, problems)."""
     if isinstance(payload, str):
-        obj = _first_json_object(payload)
+        obj = _first_json_object(payload, prefer="candidates")
         if obj is None:
             return [], ["answer holds no JSON object"]
         payload = obj
@@ -1442,6 +1450,12 @@ def needs_assist(det: dict) -> bool:
     return det.get("kind") == "unknown" or not det.get("renderable")
 
 
+def key_missing(det: dict, key: str | None) -> bool:
+    """No key was given and the server turned the keyless probes away (401/403): a judge cannot help, since
+    every candidate would be checked without credentials and fail even when its format is right."""
+    return not key and not det.get("auth") and any(p.get("status") in (401, 403) for p in det.get("probes") or [])
+
+
 def assist_endpoint(det: dict, key: str | None, judge) -> dict:
     """Ask the judge about one endpoint and verify each candidate it proposes with a real request.
 
@@ -1470,9 +1484,10 @@ def _candidate_path(cand: dict) -> str:
 
 
 def print_assist(name: str, result: dict) -> None:
-    """One line per candidate, plus a catalog endpoint block for each verified one.
+    """One line per candidate, plus the connection format of each verified one as YAML.
 
-    result may also carry "root" and "key_env" (the endpoint's), used in that block."""
+    That block is for reference only: catalog.yaml reads just base_url and key_env today, so api/auth/query/
+    headers are not applied yet. result may also carry "root" and "key_env" (the endpoint's), used in it."""
     if result.get("judge_reason"):
         print(f"  assist: no answer - {result['judge_reason']}")
     for problem in result.get("problems") or []:
@@ -1493,7 +1508,8 @@ def print_assist(name: str, result: dict) -> None:
             block["query"] = dict(c["query"])
         if c.get("extra_headers"):
             block["headers"] = {h: "${" + header_env_name(h) + "}" for h in c["extra_headers"]}
-        print("    suggested endpoint (catalog.yaml endpoints:):")
+        print("    gateway format (reference only - catalog.yaml does not apply api/auth/query/headers yet, "
+              "so pasting this will not connect the tools):")
         text = yaml.safe_dump({name: block}, sort_keys=False, allow_unicode=True, default_flow_style=False)
         print("\n".join("      " + line for line in text.rstrip().splitlines()))
 
@@ -1509,6 +1525,10 @@ class _Assist:
 
     def __call__(self, name: str, det: dict, key: str | None, key_env: str | None) -> dict | None:
         if not self.mode or not needs_assist(det):
+            return None
+        if key_missing(det, key):
+            where = f"the environment variable {key_env}" if key_env else "the key (--key-env)"
+            print(f"  assist: skipped - the server wants a key; set {where} first")
             return None
         if not self.chosen:
             self.chosen = True

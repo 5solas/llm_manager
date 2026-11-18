@@ -91,7 +91,7 @@ uv run llm_manager.py detect --assist claude   # 설치된 Claude Code 사용
   - `auto`(기본): `assist:` 블록이 있으면 `api`, 없으면 `claude`. 단 Claude Code가 게이트웨이를 쓸 때(`ANTHROPIC_BASE_URL` 설정됨)만 `claude`를 고릅니다. Anthropic에 직접 연결된 Claude Code에 사내 응답 정보를 보내려면 `--assist claude`로 명시해야 하고, 이때 경고를 출력합니다.
 - 무엇을 보내나: 점검 때 보낸 요청(메서드, 경로, 인증 방식 이름, 상태 코드), 응답 헤더(쿠키·인증 헤더 제외), 응답 본문 앞 500자, `/openapi.json`이 있으면 경로 목록과 `securitySchemes`. **키 값은 보내지 않습니다.** 모든 텍스트에서 키를 `<key>`로 바꾸고, 보내기 직전에 키가 남아 있는지 다시 검사합니다.
 - 결과: LLM이 제안한 후보(최대 3개)마다 `<api_base>/models`를 실제로 호출해 확인하고 상태를 붙입니다.
-  - `verified`: 실제 요청이 성공했습니다. 붙여 넣을 수 있는 endpoint 설정 예시를 함께 출력합니다.
+  - `verified`: 실제 요청이 성공했습니다. 확인된 게이트웨이 연결 형식(`api`, `auth`, `query`, `headers`)을 YAML로 함께 출력합니다. **이 블록은 참고용입니다.** 지금의 `catalog.yaml`은 endpoint의 `base_url`과 `key_env`만 읽고 `api`/`auth`/`query`/`headers`는 아직 적용하지 않으므로, 그대로 붙여 넣어도 툴이 연결되지 않습니다 (endpoint별 형식 지정은 별도 작업입니다).
   - `failed`: 실제 요청이 실패했습니다 (HTTP 상태와 이유 표시).
   - `needs value`: 추가 헤더(예: `X-Tenant-Id`)가 필요한데 값이 없습니다. 값은 추측하지 않고 `LLM_HEADER_` + 헤더 이름(대문자, 영숫자 외 문자는 `_`) 환경변수에서만 읽습니다. 예: `X-Tenant-Id` → `LLM_HEADER_X_TENANT_ID`. 값을 넣고 다시 실행하면 그 값으로 확인합니다.
 

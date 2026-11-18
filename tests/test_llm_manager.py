@@ -1244,6 +1244,7 @@ def test_print_assist_lines_and_yaml(capsys):
     assert "  assist: [verified] azure-openai, api-key: <key>, /openai?api-version=2024-10-21 - apim" in out
     assert "  assist: [failed] azure-openai, Authorization: Bearer <key>, /openai/v1 - " in out
     assert "HTTP 401: nope" in out and "unknown api" in out
+    assert "reference only" in out and "suggested endpoint" not in out
     yaml_text = out[out.index("corp:"):out.index("[failed]")].rsplit("\n", 1)[0]
     block = yaml.safe_load(yaml_text)["corp"]
     assert block == {"base_url": "https://gw/openai", "key_env": "K", "api": "azure-openai", "auth": "api-key",
@@ -1262,3 +1263,42 @@ def test_discover_assist_saves_candidates(tmp_path, assist_env, capsys):
     assert json.loads(saved_text)["corp"]["assist"]["candidates"][0]["status"] == "verified"
     assert TARGET_KEY not in saved_text
     assert "[verified]" in capsys.readouterr().out
+
+
+def test_parse_candidates_prefers_the_answer_over_a_quoted_body():
+    answer = json.dumps({"candidates": [cand(reason="apim")]})
+    text = f'The gateway said {{"error": "Access denied"}} so:\n```json\n{answer}\n```'
+    cands, probs = lm.parse_candidates(text)
+    assert probs == [] and [c["reason"] for c in cands] == ["apim"]
+    cands, probs = lm.parse_candidates('Only {"error": "Access denied"} here')
+    assert cands == [] and probs == ["answer has no 'candidates' list"]
+
+
+def test_assist_endpoint_reads_answer_after_quoted_body():
+    with fake_server(AZURE_ROUTES, need=("api-key", TARGET_KEY)) as (target, _):
+        det = lm.detect_server(target, TARGET_KEY)
+        text = ('The gateway said {"error": "unauthorized"} so:\n```json\n'
+                + json.dumps({"candidates": [AZURE_CAND]}) + "\n```")
+        res = lm.assist_endpoint(det, TARGET_KEY, lambda ev: (text, ""))
+    assert res["problems"] == [] and [c["status"] for c in res["candidates"]] == ["verified"]
+
+
+def test_assist_skipped_when_the_key_is_not_set(tmp_path, assist_env, monkeypatch, capsys):
+    monkeypatch.delenv("CORP_KEY")
+    monkeypatch.setattr(lm, "ask_api", lambda *a, **k: pytest.fail("ask_api called"))
+    monkeypatch.setattr(lm, "ask_claude", lambda *a, **k: pytest.fail("ask_claude called"))
+    with fake_server(AZURE_ROUTES, need=("api-key", TARGET_KEY)) as (target, _):
+        code = lm.main(["--catalog", str(assist_catalog(tmp_path, target, "https://judge.example")),
+                        "detect", "--assist"])
+    out = capsys.readouterr().out
+    assert code == 1 and "server:  unknown" in out
+    assert "assist: skipped" in out and "CORP_KEY" in out and "[failed]" not in out
+
+
+def test_assist_without_key_still_asks_when_nothing_was_rejected(tmp_path, assist_env, monkeypatch, capsys):
+    monkeypatch.delenv("CORP_KEY")
+    calls = []
+    monkeypatch.setattr(lm, "ask_api", lambda cfg, ev, timeout=0: calls.append(ev) or (None, "no answer"))
+    with fake_server({}) as (target, _):
+        lm.main(["--catalog", str(assist_catalog(tmp_path, target, "https://judge.example")), "detect", "--assist"])
+    assert len(calls) == 1 and "assist: skipped" not in capsys.readouterr().out
