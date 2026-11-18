@@ -951,6 +951,11 @@ def test_run_passes_input_on_stdin():
     assert (code, out) == (0, "''")
 
 
+def test_run_uses_cwd(tmp_path):
+    code, out = lm.run([sys.executable, "-c", "import os; print(os.getcwd())"], cwd=str(tmp_path))
+    assert code == 0 and Path(out).resolve() == tmp_path.resolve()
+
+
 def test_ask_api_returns_model_content(monkeypatch):
     monkeypatch.setenv("ASSIST_KEY", "ak")
     evidence = target_evidence()
@@ -976,6 +981,15 @@ def test_ask_api_reports_bad_answers(monkeypatch):
     with fake_server({"/v1/chat/completions": (200, {"choices": []}, {})}) as (url, _):
         payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
     assert payload is None and reason
+    for content in ([{"text": 5}], [{"text": {"nested": "x"}}], [{"text": None}, "loose"]):
+        answer = {"choices": [{"message": {"content": content}}]}
+        with fake_server({"/v1/chat/completions": (200, answer, {})}) as (url, _):
+            payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
+        assert payload is None and "no message content" in reason
+    parts = [{"text": "{\"candidates\""}, {"text": 7}, {"text": ":[]}"}]
+    with fake_server({"/v1/chat/completions": (200, {"choices": [{"message": {"content": parts}}]}, {})}) as (url, _):
+        payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
+    assert (payload, reason) == ("{\"candidates\":[]}", "")
     with fake_server({}, need=("Authorization", "Bearer other")) as (url, _):
         payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
     assert payload is None and "401" in reason
@@ -992,8 +1006,8 @@ def test_ask_api_unreachable(monkeypatch):
 
 
 def fake_run(calls: list, code, out):
-    def run(cmd, timeout=60, input=None):
-        calls.append((cmd, input))
+    def run(cmd, timeout=60, input=None, cwd=None):
+        calls.append((cmd, input, cwd))
         return code, out
     return run
 
@@ -1005,9 +1019,12 @@ def test_ask_claude_uses_structured_output(monkeypatch):
     evidence = target_evidence()
     payload, reason = lm.ask_claude(evidence)
     assert (payload, reason) == ({"candidates": []}, "")
-    cmd, stdin = calls[0]
+    cmd, stdin, cwd = calls[0]
     assert cmd[:2] == ["claude", "-p"]
     assert cmd[cmd.index("--tools") + 1] == ""
+    assert "--strict-mcp-config" in cmd and "--mcp-config" not in cmd
+    assert cmd[cmd.index("--setting-sources") + 1] == "user"
+    assert cwd and Path(cwd).resolve() != Path.cwd().resolve() and not Path(cwd).exists()
     assert json.loads(cmd[cmd.index("--json-schema") + 1]) == lm.ASSIST_SCHEMA
     assert "--no-session-persistence" in cmd and cmd[cmd.index("--output-format") + 1] == "json"
     assert stdin.startswith(lm.ASSIST_PROMPT) and "<key>" in stdin and "sk-target" not in stdin

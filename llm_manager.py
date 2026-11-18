@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -768,15 +769,16 @@ def cmd_apply(cat: dict, home: Path | None, backups: Path, set_env: bool) -> lis
     return written
 
 
-def run(cmd: list[str], timeout: int = 60, input: str | None = None) -> tuple[int | None, str]:
-    """Run a command; input, when given, is passed on stdin (otherwise stdin is empty)."""
+def run(cmd: list[str], timeout: int = 60, input: str | None = None,
+        cwd: str | None = None) -> tuple[int | None, str]:
+    """Run a command (in cwd, when given); input, when given, is passed on stdin (otherwise stdin is empty)."""
     exe = shutil.which(cmd[0])
     if not exe:
         return None, f"{cmd[0]} not found on PATH"
     stdin = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
     try:
         p = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace", **stdin)
+                           encoding="utf-8", errors="replace", cwd=cwd, **stdin)
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
         return None, "timed out"
@@ -1236,7 +1238,8 @@ def ask_api(cfg: dict, evidence: dict, timeout: int = ASSIST_TIMEOUT_API) -> tup
     except (KeyError, IndexError, TypeError):
         content = None
     if isinstance(content, list):  # content parts
-        content = "".join(p.get("text") or "" for p in content if isinstance(p, dict)) or None
+        content = "".join(p["text"] for p in content
+                          if isinstance(p, dict) and isinstance(p.get("text"), str)) or None
     if not isinstance(content, (str, dict)) or not content:
         return None, "assist API answer has no message content"
     return content, ""
@@ -1257,10 +1260,17 @@ def claude_gateway_url(claude_dir: Path) -> str | None:
 
 
 def ask_claude(evidence: dict, timeout: int = ASSIST_TIMEOUT_CLAUDE) -> tuple[object | None, str]:
-    """Ask the installed Claude Code (claude -p, no tools, no saved session). Returns (answer, "") or (None, reason)."""
-    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--no-session-persistence",
-           "--json-schema", json.dumps(ASSIST_SCHEMA)]
-    code, out = run(cmd, timeout, input=ASSIST_PROMPT + "\n" + json.dumps(evidence, ensure_ascii=False, indent=1))
+    """Ask the installed Claude Code (claude -p, no saved session). Returns (answer, "") or (None, reason).
+
+    The evidence holds raw gateway bodies, so the judge gets nothing it could act with: no built-in tools
+    (--tools ""), no MCP servers (--strict-mcp-config without --mcp-config), only the user's own settings
+    (--setting-sources user keeps their gateway env and auth but skips project and local settings and their
+    hooks), and an empty temporary working directory so no project CLAUDE.md or settings are picked up."""
+    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config",
+           "--setting-sources", "user", "--no-session-persistence", "--json-schema", json.dumps(ASSIST_SCHEMA)]
+    stdin = ASSIST_PROMPT + "\n" + json.dumps(evidence, ensure_ascii=False, indent=1)
+    with tempfile.TemporaryDirectory(prefix="llm-manager-assist-") as neutral:
+        code, out = run(cmd, timeout, input=stdin, cwd=neutral)
     if code is None:
         return None, f"claude: {out}"
     if code != 0:
