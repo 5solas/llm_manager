@@ -12,6 +12,7 @@ import argparse
 import copy
 import datetime
 import difflib
+import http.client
 import json
 import os
 import re
@@ -812,11 +813,34 @@ def auth_headers(auth: str | None, key: str | None) -> dict:
     return {"Authorization": f"Bearer {key}"}
 
 
+def _origin(url: str) -> tuple[str, str, int | None]:
+    p = urllib.parse.urlsplit(url)
+    scheme = p.scheme.lower()
+    return scheme, (p.hostname or "").lower(), p.port or {"http": 80, "https": 443}.get(scheme)
+
+
+class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only within the same scheme/host/port (or http -> https on the same host and default
+    ports). urllib copies the credential headers onto the new request, so any other redirect is not followed and
+    the 3xx comes back as the status."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = _origin(req.full_url), _origin(urllib.parse.urljoin(req.full_url, newurl))
+        upgrade = old[0] == "http" and old[2] == 80 and new == ("https", old[1], 443)
+        if new != old and not upgrade:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameOriginRedirects)
+
+
 def http_call(url: str, key: str | None, body: dict | None = None, headers: dict | None = None,
               timeout: int = 30, auth: str = "bearer", query: dict | None = None):
     """Returns (status or None, parsed JSON or error text, lower-cased response headers). The key is never printed.
 
-    query is url-encoded and appended to url."""
+    query is url-encoded and appended to url. Redirects to another host are not followed (see _SameOriginRedirects).
+    A request that cannot be sent at all (e.g. a header value outside latin-1) returns (None, reason, {})."""
     if query:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(query)
     data = json.dumps(body).encode() if body is not None else None
@@ -825,13 +849,15 @@ def http_call(url: str, key: str | None, body: dict | None = None, headers: dict
     for k, v in {**auth_headers(auth, key), **(headers or {})}.items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", "replace")
             status, resp_headers = resp.status, resp.headers
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", "replace")[:300], {k.lower(): v for k, v in exc.headers.items()}
     except (urllib.error.URLError, OSError) as exc:
         return None, str(getattr(exc, "reason", exc)), {}
+    except (ValueError, http.client.HTTPException) as exc:  # e.g. non-latin-1 header, malformed reply
+        return None, f"request failed: {type(exc).__name__}", {}
     resp_headers = {k.lower(): v for k, v in resp_headers.items()}
     try:
         return status, json.loads(text), resp_headers
@@ -1028,13 +1054,16 @@ ASSIST_SCHEMA = {
 }
 HEADER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")  # used with fullmatch: no trailing newline
 CREDENTIAL_HEADERS = SECRET_HEADERS | {"x-goog-api-key", "anthropic-api-key"}
-# An extra header's name picks the env var whose value is sent (header_env_name), so names that look like
-# they point at a secret (OPENAI_API_KEY, GITHUB_TOKEN, ...) are refused, as are routing/hop-by-hop headers.
+# An extra header's name picks the env var whose value is sent (header_env_name, always LLM_HEADER_*). As a second
+# guard, names that look like they point at a secret are refused, as are routing/hop-by-hop headers.
 SECRET_NAME_PARTS = ("key", "token", "secret", "auth", "pass", "pwd", "cookie", "session", "credential", "private")
 RESERVED_HEADERS = frozenset(("host", "content-length", "transfer-encoding", "connection", "keep-alive", "te",
                               "trailer", "upgrade", "expect", "forwarded", "x-forwarded-for", "x-forwarded-host",
                               "x-forwarded-proto", "x-real-ip"))
-API_BASE_BAD = re.compile(r"[\s\x00-\x1f\x7f?#\\]")
+API_BASE_BAD = re.compile(r"[^\x21-\x7e]|[?#\\]")  # printable ASCII only: http.client cannot send anything else
+# Extra header values are read only from variables the user sets on purpose for this: LLM_HEADER_<NAME>.
+HEADER_ENV_PREFIX = "LLM_HEADER_"
+HEADER_VALUE_OK = re.compile(r"[\x20-\x7e]+")  # used with fullmatch: printable ASCII, no CR/LF
 
 
 def _first_json_object(text: str):
@@ -1112,22 +1141,28 @@ def parse_candidates(payload: object) -> tuple[list[dict], list[str]]:
 
 
 def header_env_name(header: str) -> str:
-    """Environment variable that holds an extra header's value: X-Tenant-Id -> X_TENANT_ID."""
-    return re.sub(r"[^A-Za-z0-9]", "_", header).upper()
+    """Environment variable that holds an extra header's value: X-Tenant-Id -> LLM_HEADER_X_TENANT_ID.
+
+    The fixed prefix keeps a judge-chosen header name from picking an unrelated variable (DATABASE_URL, PATH, ...)."""
+    return HEADER_ENV_PREFIX + re.sub(r"[^A-Za-z0-9]", "_", header).upper()
 
 
 def verify_candidate(root: str, key: str | None, cand: dict, timeout: int = 10) -> dict:
     """Try a candidate for real: GET <root><api_base>/models. Extra header values come only from the environment."""
-    extra, missing = {}, []
+    extra, missing, invalid = {}, [], []
     for h in cand.get("extra_headers") or []:
         env = header_env_name(h)
         value = os.environ.get(env, "")
-        if not value or "\r" in value or "\n" in value:
+        if not value:
             missing.append(f"{env} (for {h})")
+        elif not HEADER_VALUE_OK.fullmatch(value):
+            invalid.append(f"{env} (for {h})")
         else:
             extra[h] = value
-    if missing:
-        return {**cand, "status": "needs value", "detail": "set " + ", ".join(missing)}
+    if missing or invalid:
+        detail = "; ".join((["set " + ", ".join(missing)] if missing else [])
+                           + ([", ".join(invalid) + " must hold printable ASCII only"] if invalid else []))
+        return {**cand, "status": "needs value", "detail": detail}
     status, body, _ = http_call(root + cand["api_base"] + "/models", key, headers=extra, timeout=timeout,
                                 auth=cand["auth"], query=cand.get("query") or None)
     if status == 200 and isinstance(body, dict) and isinstance(body.get("data"), list):

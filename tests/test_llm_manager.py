@@ -840,8 +840,9 @@ def test_parse_candidates_drops_secret_named_and_routing_headers():
 
 
 def test_header_env_name():
-    assert lm.header_env_name("X-Tenant-Id") == "X_TENANT_ID"
-    assert lm.header_env_name("x.trace id") == "X_TRACE_ID"
+    assert lm.header_env_name("X-Tenant-Id") == "LLM_HEADER_X_TENANT_ID"
+    assert lm.header_env_name("x.trace id") == "LLM_HEADER_X_TRACE_ID"
+    assert lm.header_env_name("Database-Url") == "LLM_HEADER_DATABASE_URL"
 
 
 def test_http_call_appends_query():
@@ -870,11 +871,59 @@ def test_verify_candidate_failed():
 
 def test_verify_candidate_needs_value_then_uses_env(monkeypatch):
     c = cand(auth="bearer", query={}, extra_headers=["X-Tenant-Id"])
-    monkeypatch.delenv("X_TENANT_ID", raising=False)
+    monkeypatch.delenv("LLM_HEADER_X_TENANT_ID", raising=False)
+    monkeypatch.setenv("X_TENANT_ID", "t1")  # a variable outside the LLM_HEADER_ namespace is never read
     with fake_server({"/openai/v1/models": MODELS}, need=("X-Tenant-Id", "t1")) as (url, seen):
         res = lm.verify_candidate(url, "k", c)
-        assert res["status"] == "needs value" and "X_TENANT_ID" in res["detail"]
+        assert res["status"] == "needs value" and "LLM_HEADER_X_TENANT_ID" in res["detail"]
         assert seen == []
-        monkeypatch.setenv("X_TENANT_ID", "t1")
+        monkeypatch.setenv("LLM_HEADER_X_TENANT_ID", "t1")
         res = lm.verify_candidate(url, "k", c)
     assert res["status"] == "verified"
+
+
+KOREAN_TENANT = "".join(map(chr, (0xD14C, 0xB10C, 0xD2B8)))
+E_ACUTE = chr(0xE9)
+
+
+def test_parse_candidates_rejects_non_ascii_api_base():
+    payload = {"candidates": [cand(api_base="/op" + E_ACUTE + "nai/v1"), cand(api_base="/openai/" + E_ACUTE),
+                              cand(api_base="/a b"), cand(api_base="/a" + chr(0xA0) + "b")]}
+    cands, probs = lm.parse_candidates(payload)
+    assert cands == [] and len(probs) == 4
+
+
+def test_verify_candidate_rejects_header_values_http_cannot_send(monkeypatch):
+    c = cand(auth="bearer", query={}, extra_headers=["X-Tenant-Id"])
+    with fake_server({"/openai/v1/models": MODELS}) as (url, seen):
+        for bad in (KOREAN_TENANT, "t1" + chr(13) + chr(10) + "X-Evil: 1", "a" + chr(9) + "b"):
+            monkeypatch.setenv("LLM_HEADER_X_TENANT_ID", bad)
+            res = lm.verify_candidate(url, "k", c)
+            assert res["status"] == "needs value" and "LLM_HEADER_X_TENANT_ID" in res["detail"]
+    assert seen == []
+
+
+def test_http_call_reports_unsendable_request_without_crashing():
+    with fake_server({"/m": MODELS}) as (url, seen):
+        status, _, headers = lm.http_call(url + "/m", None, headers={"X-Tenant-Id": KOREAN_TENANT})
+        assert status is None and headers == {}
+        status, _, _ = lm.http_call(url + "/op" + E_ACUTE + "nai/models", None)
+        assert status is None
+    assert seen == []
+
+
+def test_redirect_to_another_host_does_not_carry_the_key():
+    with fake_server({"/openai/v1/models": MODELS}) as (other, other_seen):
+        moved = (302, {"error": "login"}, {"Location": other + "/openai/v1/models"})
+        with fake_server({"/openai/v1/models": moved}) as (url, seen):
+            res = lm.verify_candidate(url, "sk-secret-xyz", cand(query={}, extra_headers=[]))
+    assert other_seen == []
+    assert len(seen) == 1
+    assert res["status"] == "failed" and "302" in res["detail"]
+
+
+def test_redirect_on_the_same_server_is_followed():
+    with fake_server({"/old/models": (301, {}, {"Location": "/new/models"}), "/new/models": MODELS},
+                     need=("api-key", "k")) as (url, seen):
+        res = lm.verify_candidate(url, "k", cand(api_base="/old", query={}, extra_headers=[]))
+    assert res["status"] == "verified" and [s[1] for s in seen] == ["/old/models", "/new/models"]

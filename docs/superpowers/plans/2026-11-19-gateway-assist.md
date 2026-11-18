@@ -25,7 +25,7 @@
 ## Review Focus
 
 - Judge returns prose, fenced ```json, or broken JSON → unusable answer is reported, no crash, other endpoints still processed. (Task 2 `parse_candidates`, Task 3 judges)
-- Candidate `api_base` is an absolute URL or starts with `//` → rejected, so the key is never sent to another host. (Task 2)
+- Candidate `api_base` is an absolute URL or starts with `//` → rejected, and redirects to another host are not followed, so the key is never sent to another host. (Task 2)
 - `extra_headers` contains `Authorization`/`api-key`/`x-api-key`/`Cookie` or names with spaces/CR/LF → dropped. (Task 2)
 - Gateway echoes the key inside an error body or header → redacted before it reaches the judge. (Task 1)
 - Judge unreachable, times out, or `claude` not installed → one clear line, detection result still printed. (Task 3, Task 4)
@@ -64,8 +64,8 @@
   - `ASSIST_APIS = ("openai-chat", "openai-responses", "anthropic-messages", "azure-openai")`
   - `ASSIST_SCHEMA: dict` — JSON Schema for `{"candidates": [{"api","auth","api_base","query","extra_headers","reason"}]}` (enums from `ASSIST_APIS` and `AUTH_STYLES + ("none",)`), used by Task 3.
   - `parse_candidates(payload: object) -> tuple[list[dict], list[str]]` — accepts a dict or a string (extracts the first `{...}` JSON object, also inside ``` fences); returns (valid candidates, max 3, normalized with defaults `query={}`, `extra_headers=[]`, `reason=""`), problems).
-  - `header_env_name(header: str) -> str` — `"X-Tenant-Id" -> "X_TENANT_ID"` (upper-case, non-alphanumerics → `_`).
-  - `verify_candidate(root: str, key: str | None, cand: dict, timeout: int = 10) -> dict` — returns `{**cand, "status": "verified"|"failed"|"needs value", "detail": str}`. `needs value` when an extra header's env var is unset (no request sent). Otherwise GET `root + api_base + "/models"` with `auth_headers(cand["auth"], key)`, extra header values from env, and `query`; `verified` iff 200 with a `data` list.
+  - `header_env_name(header: str) -> str` — `"X-Tenant-Id" -> "LLM_HEADER_X_TENANT_ID"` (fixed `LLM_HEADER_` prefix + upper-case, non-alphanumerics → `_`). The prefix keeps a judge-chosen header name from picking an unrelated variable such as `DATABASE_URL`; the secret-name denylist stays as a second guard.
+  - `verify_candidate(root: str, key: str | None, cand: dict, timeout: int = 10) -> dict` — returns `{**cand, "status": "verified"|"failed"|"needs value", "detail": str}`. `needs value` when an extra header's env var is unset or holds anything but printable ASCII (no request sent). Otherwise GET `root + api_base + "/models"` with `auth_headers(cand["auth"], key)`, extra header values from env, and `query`; `verified` iff 200 with a `data` list.
 - [ ] **Step 1: Write failing tests**
   - `test_parse_candidates_from_fenced_text`: "Here:\n```json\n{\"candidates\":[{\"api\":\"azure-openai\",\"auth\":\"api-key\",\"api_base\":\"/openai/v1\",\"reason\":\"apim\"}]}\n```" → one candidate, `query == {}`, `extra_headers == []`, no problems.
   - `test_parse_candidates_rejects_bad_answers`: `"no idea"` → `([], [problem])`; unknown `api` value dropped with a problem; 5 valid candidates → 3 kept.
@@ -73,9 +73,9 @@
   - `test_parse_candidates_drops_credential_and_malformed_headers`: `extra_headers ["Authorization", "api-key", "Cookie", "X Bad", "X-Ok\r\nY: z", "X-Tenant-Id"]` → `["X-Tenant-Id"]`.
   - `test_verify_candidate_verified_with_query`: fake requiring `api-key` and path `/openai/models?api-version=2024-10-21` → `status == "verified"`.
   - `test_verify_candidate_failed`: wrong auth → `"failed"` with the HTTP status in `detail`.
-  - `test_verify_candidate_needs_value_then_uses_env(monkeypatch)`: candidate with `extra_headers ["X-Tenant-Id"]`; env unset → `"needs value"` and `"X_TENANT_ID"` in `detail`; `setenv("X_TENANT_ID","t1")` with fake requiring that header → `"verified"`.
+  - `test_verify_candidate_needs_value_then_uses_env(monkeypatch)`: candidate with `extra_headers ["X-Tenant-Id"]`; env unset (an unprefixed `X_TENANT_ID` is ignored) → `"needs value"` and `"LLM_HEADER_X_TENANT_ID"` in `detail`; `setenv("LLM_HEADER_X_TENANT_ID","t1")` with fake requiring that header → `"verified"`.
 - [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.** Header-name rule: `^[A-Za-z0-9][A-Za-z0-9-]{0,63}$` and not in the credential set (case-insensitive). `api_base` rule: must start with `/` and not `//`, no `://`.
+- [ ] **Step 3: Implement.** Header-name rule: `^[A-Za-z0-9][A-Za-z0-9-]{0,63}$` and not in the credential set (case-insensitive). `api_base` rule: must start with `/` and not `//`, no `://`, printable ASCII only, no `?`/`#`/`\`. `http_call` follows redirects only within the same scheme/host/port (plus http→https on the same host), so the key never follows a redirect to another host; a request that cannot be sent (e.g. a non-latin-1 header) returns `(None, reason, {})` instead of raising.
 - [ ] **Step 4: Run full suite, expect PASS.** (The fake server routes on `self.path`, which includes the query string.)
 - [ ] **Step 5: Commit** `Parse and verify assist connection candidates`.
 
@@ -131,6 +131,6 @@
   - `test_assist_without_judge_keeps_detection_output(...)`: no `assist:`, no gateway → exit code unchanged from plain detect, output has the detection block and the `--assist claude` hint.
   - `test_detect_without_assist_flag_never_calls_judge(monkeypatch)`: monkeypatch `ask_api`/`ask_claude` to `pytest.fail` → plain `detect` works.
 - [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement, plus README (Korean) subsection "LLM 판단 지원 (`--assist`)" covering: when it runs, A/C choice and the `auto` rule, what is sent (no key), `needs value` and the `X_TENANT_ID` env naming, that results are suggestions and catalog is not modified; and the commented `assist:` block in `catalog.example.yaml`.**
+- [ ] **Step 3: Implement, plus README (Korean) subsection "LLM 판단 지원 (`--assist`)" covering: when it runs, A/C choice and the `auto` rule, what is sent (no key), `needs value` and the `LLM_HEADER_X_TENANT_ID` env naming, that results are suggestions and catalog is not modified; and the commented `assist:` block in `catalog.example.yaml`.**
 - [ ] **Step 4: Run full suite, expect PASS.**
 - [ ] **Step 5: Commit** `Add --assist to detect and discover`.
