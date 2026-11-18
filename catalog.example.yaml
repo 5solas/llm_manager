@@ -45,12 +45,12 @@ policy:
 #     ultrabrain: {tier: tier1, reasoning: max}
 #     quick: tier3
 
-# claude_code:                    # defaults: first Claude model of tier1/2/3
+# claude_code:                    # defaults: Claude models of tier1/2/3 on the main model's endpoint
 #   model: claude-sonnet-example
 #   opus: claude-opus-example
 #   sonnet: claude-sonnet-example
 #   haiku: claude-haiku-example
-#   key_env: ANTHROPIC_AUTH_TOKEN
+#   key_env: COMPANY_LLM_KEY      # default: that endpoint's key_env, read through apiKeyHelper
 
 # mcp:                            # installed into all four tools
 #   internal-docs:

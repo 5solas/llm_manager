@@ -1,5 +1,7 @@
 import contextlib
 import json
+import shutil
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -603,3 +605,105 @@ def test_verify_counts_preflight_problems(monkeypatch, capsys):
     raw["tools"] = {"opencode": False, "omo": False, "hermes": False, "claude_code": False}
     assert lm.cmd_verify(lm.normalize_catalog(raw)) == 1
     assert "[FAIL] corp" in capsys.readouterr().out
+
+
+# ---- Claude Code across several endpoints
+
+def two_endpoint_raw() -> dict:
+    """prod and rnd both serve Claude models; tiers mix the two endpoints."""
+    return {
+        "endpoints": {"prod": {"base_url": "https://prod.example.com", "key_env": "PROD_KEY"},
+                      "rnd": {"base_url": "https://rnd.example.com", "key_env": "RND_KEY"}},
+        "models": {
+            "opus-prod": {"endpoint": "prod", "family": "claude", "context": 200000},
+            "sonnet-rnd": {"endpoint": "rnd", "family": "claude", "context": 200000},
+            "sonnet-prod": {"endpoint": "prod", "family": "claude", "context": 200000},
+            "haiku-rnd": {"endpoint": "rnd", "family": "claude", "context": 200000},
+            "gpt-rnd": {"endpoint": "rnd", "family": "gpt", "context": 200000},
+        },
+        "tiers": {"tier1": ["opus-prod", "gpt-rnd"], "tier2": ["sonnet-rnd", "sonnet-prod"], "tier3": ["haiku-rnd"]},
+        "default": "opus-prod",
+    }
+
+
+def test_claude_code_auto_pick_stays_on_the_main_models_endpoint():
+    cc = lm.normalize_catalog(two_endpoint_raw())["claude_code"]
+    assert cc["endpoint"] == "prod"
+    assert (cc["model"], cc["opus"], cc["sonnet"]) == ("opus-prod", "opus-prod", "sonnet-prod")
+
+
+def test_claude_code_slot_borrows_from_another_tier_on_the_same_endpoint():
+    cc = lm.normalize_catalog(two_endpoint_raw())["claude_code"]
+    assert cc["haiku"] == "sonnet-prod"  # tier3 has no prod Claude model; the nearest tier on prod does
+
+
+def test_claude_code_endpoint_follows_an_explicit_main_model():
+    raw = two_endpoint_raw()
+    raw["claude_code"] = {"model": "sonnet-rnd"}
+    cc = lm.normalize_catalog(raw)["claude_code"]
+    assert cc["endpoint"] == "rnd"
+    assert (cc["opus"], cc["sonnet"], cc["haiku"]) == ("sonnet-rnd", "sonnet-rnd", "haiku-rnd")
+
+
+def test_claude_code_endpoint_follows_a_non_claude_default():
+    raw = two_endpoint_raw()
+    raw["default"] = "gpt-rnd"
+    cc = lm.normalize_catalog(raw)["claude_code"]
+    assert cc["endpoint"] == "prod" and cc["model"] == "opus-prod"  # first Claude model in tier order
+
+
+def test_claude_code_explicit_mix_of_endpoints_is_still_reported():
+    raw = two_endpoint_raw()
+    raw["claude_code"] = {"model": "opus-prod", "haiku": "haiku-rnd"}
+    assert "claude_code: all Claude Code models must be on the same endpoint" in problems(raw)
+
+
+# ---- Claude Code key follows its endpoint
+
+HELPER = r"C:\Users\me\.claude\api-key.ps1"
+
+
+def test_claude_code_key_defaults_to_its_endpoints_key():
+    assert lm.normalize_catalog(two_endpoint_raw())["claude_code"]["key_env"] == "PROD_KEY"
+
+
+def test_claude_settings_read_the_endpoint_key_through_the_helper():
+    cat = lm.normalize_catalog(two_endpoint_raw())
+    cfg, _ = lm.render_claude_settings(cat, "s.ps1", HELPER)
+    assert cfg["apiKeyHelper"] == f'powershell -NoProfile -ExecutionPolicy Bypass -File "{HELPER}" PROD_KEY'
+    assert cfg["env"]["ANTHROPIC_BASE_URL"] == "https://prod.example.com"
+
+
+def test_native_claude_key_variable_needs_no_helper():
+    raw = two_endpoint_raw()
+    raw["claude_code"] = {"key_env": "ANTHROPIC_AUTH_TOKEN"}
+    cfg, _ = lm.render_claude_settings(lm.normalize_catalog(raw), "s.ps1", HELPER)
+    assert "apiKeyHelper" not in cfg
+
+
+def test_key_helper_script_is_installed(tmp_path):
+    ops, _ = lm.plan_files(lm.normalize_catalog(two_endpoint_raw()), tmp_path)
+    helper = [op for op in ops if op.rel == "claude/api-key.ps1"]
+    assert helper and helper[0].target == tmp_path / ".claude" / "api-key.ps1"
+
+
+def test_key_instructions_warn_when_a_claude_variable_would_override_the_helper(monkeypatch):
+    cat = lm.normalize_catalog(two_endpoint_raw())
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    assert not any("ANTHROPIC_" in line for line in lm.key_instructions(cat))
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "old")
+    warning = [line for line in lm.key_instructions(cat) if "ANTHROPIC_AUTH_TOKEN" in line]
+    assert warning and "PROD_KEY" in warning[0]
+
+
+@pytest.mark.skipif(not shutil.which("powershell"), reason="needs Windows PowerShell")
+def test_key_helper_script_prints_only_the_key(monkeypatch):
+    script = lm.ROOT / "claude" / "api-key.ps1"
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "LLM_MANAGER_TEST_KEY"]
+    monkeypatch.setenv("LLM_MANAGER_TEST_KEY", "sk-helper-1")
+    ok = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert (ok.returncode, ok.stdout) == (0, "sk-helper-1")
+    monkeypatch.delenv("LLM_MANAGER_TEST_KEY")
+    missing = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert missing.returncode != 0 and missing.stdout == "" and "LLM_MANAGER_TEST_KEY" in missing.stderr

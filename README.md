@@ -18,8 +18,7 @@ git clone https://github.com/5solas/llm_manager
 cd llm_manager
 
 # 1. 키를 환경변수로 등록 (새 터미널부터 적용됩니다)
-setx COMPANY_LLM_KEY "<내 키>"
-setx ANTHROPIC_AUTH_TOKEN "<내 키>"                    # Claude Code가 읽는 이름
+setx COMPANY_LLM_KEY "<내 키>"                         # Claude Code도 이 키를 씁니다 (apiKeyHelper)
 opencode service set env COMPANY_LLM_KEY "<내 키>"     # opencode2는 백그라운드 서비스가 키를 읽습니다
 
 # 2. 카탈로그를 만들고 게이트웨이 주소를 적기
@@ -86,6 +85,7 @@ uv run llm_manager.py detect --url https://llm-gateway.example.com --key-env COM
 | hermes | `%LOCALAPPDATA%\hermes\config.yaml` | 기존 파일에 병합 (`model`은 통째로 교체) |
 | Claude Code | `~/.claude/settings.json` | 기존 파일에 병합 |
 | Claude Code | `~/.claude/statusline.ps1` | `claude/statusline.ps1` 복사 |
+| Claude Code | `~/.claude/api-key.ps1` | `claude/api-key.ps1` 복사 (키를 환경변수에서 읽어 넘김) |
 | Claude Code | `~/.claude/CLAUDE.md` | `llm_manager` 표시 구간만 교체 |
 | 공통 | `~/.claude/skills/` | `skills/` 복사 |
 
@@ -107,6 +107,8 @@ provider는 항상 카탈로그의 endpoint만 허용합니다(opencode2는 정�
 ## 알아 둘 점
 
 - **Claude Code는 Claude 계열 모델만** 배정합니다. 게이트웨이를 거쳐도 다른 계열 모델은 공식 지원 대상이 아닙니다. 게이트웨이가 Anthropic 형식(`/v1/messages`)을 지원해야 하며 `discover`가 확인해 줍니다. 지원하지 않으면 `tools: {claude_code: false}`로 끄세요.
+- **Claude Code는 endpoint 하나만** 씁니다 (`ANTHROPIC_BASE_URL`이 하나뿐). 메인 모델(`default`가 Claude 모델이면 그것, 아니면 tier 순서상 첫 Claude 모델)의 endpoint를 고르고, opus/sonnet/haiku 슬롯은 같은 endpoint의 Claude 모델로만 채웁니다. 해당 tier에 없으면 가까운 tier에서 가져옵니다. `claude_code`에 서로 다른 endpoint의 모델을 직접 적었을 때만 오류입니다.
+- Claude Code의 키는 그 endpoint의 `key_env`에서 읽습니다. `settings.json`의 `apiKeyHelper`가 `api-key.ps1`을 실행하고, 이 스크립트는 환경변수 값만 출력합니다. `ANTHROPIC_AUTH_TOKEN`이나 `ANTHROPIC_API_KEY`가 설정돼 있으면 Claude Code가 그쪽을 먼저 쓰므로, `apply`가 지우라고 안내합니다.
 - Claude Code가 모델 이름을 못 알아보면 컨텍스트 크기를 1M으로 가정한다는 경고가 나옵니다. 동작에는 문제가 없습니다.
 - **hermes는 컨텍스트 64,000 토큰 미만 모델을 거부**하므로 그런 모델은 hermes 설정에서 빠집니다.
 - 사내 인증서로 HTTPS를 검사하는 망에서 hermes가 인증서 오류를 내면 `SSL_CERT_FILE`에 사내 CA 파일 경로를 지정하세요. opencode2는 `opencode service set env NODE_EXTRA_CA_CERTS <경로>`, omo와 Claude Code는 `NODE_EXTRA_CA_CERTS` 환경변수를 씁니다.
