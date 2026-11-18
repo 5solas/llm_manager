@@ -768,13 +768,15 @@ def cmd_apply(cat: dict, home: Path | None, backups: Path, set_env: bool) -> lis
     return written
 
 
-def run(cmd: list[str], timeout: int = 60) -> tuple[int | None, str]:
+def run(cmd: list[str], timeout: int = 60, input: str | None = None) -> tuple[int | None, str]:
+    """Run a command; input, when given, is passed on stdin (otherwise stdin is empty)."""
     exe = shutil.which(cmd[0])
     if not exe:
         return None, f"{cmd[0]} not found on PATH"
+    stdin = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
     try:
         p = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
+                           encoding="utf-8", errors="replace", **stdin)
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
         return None, "timed out"
@@ -1170,6 +1172,138 @@ def verify_candidate(root: str, key: str | None, cand: dict, timeout: int = 10) 
     text = body if isinstance(body, str) else json.dumps(body)
     reason = "no model list" if status == 200 else f"HTTP {status}" if status else "unreachable"
     return {**cand, "status": "failed", "detail": f"{reason}: {redact_body(text, key, 200)}"}
+
+
+ASSIST_PROMPT = (
+    "You are given HTTP probe evidence for an LLM gateway: the requests a detection tool sent (method, path, "
+    "auth style, status), the response headers and error bodies it got back, and the OpenAPI summary if the server "
+    "published one. Credential values were replaced with <key> and credential headers were removed.\n"
+    "Propose at most 3 connection formats that would let a client list models and chat through this gateway, as "
+    "one JSON object matching this shape and nothing else:\n"
+    '{"candidates": [{"api": "openai-chat|openai-responses|anthropic-messages|azure-openai", '
+    '"auth": "bearer|api-key|x-api-key|none", "api_base": "/path/under/the/server/root", '
+    '"query": {"name": "value"}, "extra_headers": ["Header-Name"], "reason": "short evidence-based reason"}]}\n'
+    "Rules: api_base is a path on this same server (it starts with /, never a full URL); the client checks a "
+    "candidate with GET <root><api_base>/models. Put query parameters the server needs (such as api-version) in "
+    "query. List in extra_headers only the names of non-credential headers the server requires (such as a tenant "
+    "id); never invent header values and never list the auth header there. Prefer formats the evidence supports, "
+    "best first, and say in reason which evidence points to it. Return an empty candidates list if the evidence "
+    "gives no basis for a guess.\n\nEvidence:"
+)
+ASSIST_TIMEOUT_API = 120
+ASSIST_TIMEOUT_CLAUDE = 300
+
+
+def assist_config(raw: dict) -> tuple[dict | None, list[str]]:
+    """The catalog's optional assist: block (an OpenAI-compatible chat completions API with Bearer auth).
+
+    Returns ({"root", "key_env", "model"}, []) when usable, (None, problems) when broken, (None, []) when absent."""
+    block = (raw or {}).get("assist")
+    if block is None:
+        return None, []
+    if not isinstance(block, dict):
+        return None, ["assist: must be a mapping with base_url, key_env and model"]
+    problems = []
+    root = endpoint_root(block.get("base_url"))
+    if not root.startswith(("http://", "https://")):
+        problems.append("assist.base_url: must start with http:// or https://")
+    for field_name, text in (("key_env", "name of the environment variable holding the assist API key"),
+                             ("model", "model the assist API should use")):
+        if not isinstance(block.get(field_name), str) or not block[field_name].strip():
+            problems.append(f"assist.{field_name}: {text} is required")
+    if problems:
+        return None, problems
+    return {"root": root, "key_env": block["key_env"].strip(), "model": block["model"].strip()}, []
+
+
+def ask_api(cfg: dict, evidence: dict, timeout: int = ASSIST_TIMEOUT_API) -> tuple[object | None, str]:
+    """Ask the configured assist API (OpenAI chat completions, Bearer). Returns (message content, "") or
+    (None, reason)."""
+    key = os.environ.get(cfg["key_env"])
+    if not key:
+        return None, f"environment variable {cfg['key_env']} (assist API key) is not set"
+    body = {"model": cfg["model"], "temperature": 0,
+            "messages": [{"role": "system", "content": ASSIST_PROMPT},
+                         {"role": "user", "content": json.dumps(evidence, ensure_ascii=False)}]}
+    status, answer, _ = http_call(cfg["root"] + "/v1/chat/completions", key, body, timeout=timeout)
+    if status is None:
+        return None, f"assist API {cfg['root']} is unreachable: {redact_body(str(answer), key, 200)}"
+    if status != 200:
+        text = answer if isinstance(answer, str) else json.dumps(answer)
+        return None, f"assist API answered HTTP {status}: {redact_body(text, key, 200)}"
+    try:
+        content = answer["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        content = None
+    if isinstance(content, list):  # content parts
+        content = "".join(p.get("text") or "" for p in content if isinstance(p, dict)) or None
+    if not isinstance(content, (str, dict)) or not content:
+        return None, "assist API answer has no message content"
+    return content, ""
+
+
+def claude_gateway_url(claude_dir: Path) -> str | None:
+    """The gateway Claude Code talks to (ANTHROPIC_BASE_URL from the environment, else from its settings.json)."""
+    url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if url:
+        return url
+    try:
+        settings = json.loads((Path(claude_dir) / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    env = settings.get("env") if isinstance(settings, dict) else None
+    url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+    return url.strip() if isinstance(url, str) and url.strip() else None
+
+
+def ask_claude(evidence: dict, timeout: int = ASSIST_TIMEOUT_CLAUDE) -> tuple[object | None, str]:
+    """Ask the installed Claude Code (claude -p, no tools, no saved session). Returns (answer, "") or (None, reason)."""
+    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--no-session-persistence",
+           "--json-schema", json.dumps(ASSIST_SCHEMA)]
+    code, out = run(cmd, timeout, input=ASSIST_PROMPT + "\n" + json.dumps(evidence, ensure_ascii=False, indent=1))
+    if code is None:
+        return None, f"claude: {out}"
+    if code != 0:
+        return None, f"claude exited with code {code}: {out[-300:]}"
+    try:
+        data = json.loads(out)
+    except ValueError:
+        data = _first_json_object(out)
+    if not isinstance(data, dict):
+        return None, "claude printed no JSON result"
+    if data.get("is_error"):
+        return None, f"claude reported an error: {str(data.get('result') or data.get('subtype') or '')[:300]}"
+    payload = data.get("structured_output")
+    if payload is None:
+        payload = data.get("result")
+    if payload is None or payload == "":
+        return None, "claude returned no answer"
+    return payload, ""
+
+
+def choose_judge(mode: str, raw: dict, claude_dir: Path) -> tuple[str | None, object, list[str]]:
+    """Pick who answers: the assist: API ("api") or Claude Code ("claude").
+
+    Returns (name or None, callable evidence -> (payload, reason) or None, messages to print).
+    auto: the assist: block when the catalog has one, else Claude Code only when it is on a gateway."""
+    if mode not in ("auto", "api", "claude"):
+        raise ValueError(f"unknown assist mode {mode!r}")
+    cfg, problems = assist_config(raw)
+    if mode == "claude":
+        if claude_gateway_url(claude_dir):
+            return "claude", ask_claude, ["assist: asking Claude Code (through its gateway)"]
+        return "claude", ask_claude, ["warning: Claude Code is not on a gateway (ANTHROPIC_BASE_URL is not set), so "
+                                      "the redacted probe evidence goes to Anthropic directly"]
+    if cfg:
+        return "api", lambda evidence: ask_api(cfg, evidence), [f"assist: asking {cfg['model']} at {cfg['root']}"]
+    if problems or mode == "api":
+        return None, None, ["assist: skipped - " + ("; ".join(problems) if problems else
+                                                     "the catalog has no assist: block (base_url, key_env, model)")]
+    if claude_gateway_url(claude_dir):
+        return "claude", ask_claude, ["assist: asking Claude Code (through its gateway)"]
+    return None, None, ["assist: skipped - the catalog has no assist: block and Claude Code is not on a gateway "
+                        "(ANTHROPIC_BASE_URL is not set); add an assist: block, or pass --assist claude to send the "
+                        "redacted evidence to Anthropic"]
 
 
 def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:

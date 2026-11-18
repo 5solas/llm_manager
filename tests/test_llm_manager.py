@@ -336,8 +336,9 @@ def test_discover_against_fake_gateway():
 # ---- detect
 
 @contextlib.contextmanager
-def fake_server(routes: dict, need: tuple[str, str] | None = None):
-    """routes: {path: (status, body, headers)}. need: (header, value) every request must carry, else 401."""
+def fake_server(routes: dict, need: tuple[str, str] | None = None, bodies: list | None = None):
+    """routes: {path: (status, body, headers)}. need: (header, value) every request must carry, else 401.
+    bodies: when given, each request body (decoded text) is appended to it."""
     seen = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -345,7 +346,9 @@ def fake_server(routes: dict, need: tuple[str, str] | None = None):
             pass
 
         def _reply(self):
-            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if bodies is not None:
+                bodies.append(raw.decode("utf-8", "replace"))
             seen.append((self.command, self.path, {k.lower(): v for k, v in self.headers.items()}))
             if need and self.headers.get(need[0]) != need[1]:
                 status, body, headers = 401, {"error": "unauthorized"}, {}
@@ -927,3 +930,169 @@ def test_redirect_on_the_same_server_is_followed():
                      need=("api-key", "k")) as (url, seen):
         res = lm.verify_candidate(url, "k", cand(api_base="/old", query={}, extra_headers=[]))
     assert res["status"] == "verified" and [s[1] for s in seen] == ["/old/models", "/new/models"]
+
+
+# ---- assist: judges
+
+ASSIST_RAW = {"assist": {"base_url": "https://judge.example", "key_env": "ASSIST_KEY", "model": "judge-1"}}
+
+
+def target_evidence() -> dict:
+    """Evidence from a target gateway that echoes the key sk-target in its error body."""
+    with fake_server({"/v1/models": (401, {"error": "bad key sk-target"}, {})}) as (url, _):
+        det = lm.detect_server(url, "sk-target")
+    return lm.build_evidence(det, "sk-target")
+
+
+def test_run_passes_input_on_stdin():
+    code, out = lm.run([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"], input="hello")
+    assert (code, out) == (0, "HELLO")
+    code, out = lm.run([sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"])
+    assert (code, out) == (0, "''")
+
+
+def test_ask_api_returns_model_content(monkeypatch):
+    monkeypatch.setenv("ASSIST_KEY", "ak")
+    evidence = target_evidence()
+    answer = {"choices": [{"message": {"content": "{\"candidates\":[]}"}}]}
+    bodies = []
+    with fake_server({"/v1/chat/completions": (200, answer, {})}, need=("Authorization", "Bearer ak"),
+                     bodies=bodies) as (url, seen):
+        cfg, probs = lm.assist_config({"assist": {"base_url": url, "key_env": "ASSIST_KEY", "model": "judge-1"}})
+        payload, reason = lm.ask_api(cfg, evidence)
+    assert probs == [] and (payload, reason) == ("{\"candidates\":[]}", "")
+    assert [(m, p) for m, p, _ in seen] == [("POST", "/v1/chat/completions")]
+    sent = json.loads(bodies[0])
+    assert sent["model"] == "judge-1" and sent["temperature"] == 0
+    assert [m["role"] for m in sent["messages"]] == ["system", "user"]
+    assert sent["messages"][0]["content"] == lm.ASSIST_PROMPT
+    user = sent["messages"][1]["content"]
+    assert "<key>" in user and "sk-target" not in user and "sk-target" not in bodies[0]
+    assert json.loads(user) == evidence
+
+
+def test_ask_api_reports_bad_answers(monkeypatch):
+    monkeypatch.setenv("ASSIST_KEY", "ak")
+    with fake_server({"/v1/chat/completions": (200, {"choices": []}, {})}) as (url, _):
+        payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
+    assert payload is None and reason
+    with fake_server({}, need=("Authorization", "Bearer other")) as (url, _):
+        payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
+    assert payload is None and "401" in reason
+    monkeypatch.delenv("ASSIST_KEY")
+    payload, reason = lm.ask_api({"root": url, "key_env": "ASSIST_KEY", "model": "m"}, {})
+    assert payload is None and "ASSIST_KEY" in reason
+
+
+def test_ask_api_unreachable(monkeypatch):
+    monkeypatch.setenv("ASSIST_KEY", "ak")
+    cfg, _ = lm.assist_config({"assist": {"base_url": "http://127.0.0.1:9", "key_env": "ASSIST_KEY", "model": "m"}})
+    payload, reason = lm.ask_api(cfg, {}, timeout=5)
+    assert payload is None and reason
+
+
+def fake_run(calls: list, code, out):
+    def run(cmd, timeout=60, input=None):
+        calls.append((cmd, input))
+        return code, out
+    return run
+
+
+def test_ask_claude_uses_structured_output(monkeypatch):
+    calls = []
+    monkeypatch.setattr(lm, "run", fake_run(calls, 0, json.dumps({"structured_output": {"candidates": []},
+                                                                  "result": "ignored"})))
+    evidence = target_evidence()
+    payload, reason = lm.ask_claude(evidence)
+    assert (payload, reason) == ({"candidates": []}, "")
+    cmd, stdin = calls[0]
+    assert cmd[:2] == ["claude", "-p"]
+    assert cmd[cmd.index("--tools") + 1] == ""
+    assert json.loads(cmd[cmd.index("--json-schema") + 1]) == lm.ASSIST_SCHEMA
+    assert "--no-session-persistence" in cmd and cmd[cmd.index("--output-format") + 1] == "json"
+    assert stdin.startswith(lm.ASSIST_PROMPT) and "<key>" in stdin and "sk-target" not in stdin
+
+
+def test_ask_claude_falls_back_to_result_text(monkeypatch):
+    monkeypatch.setattr(lm, "run", fake_run([], 0, json.dumps({"result": "```json\n{\"candidates\": []}\n```"})))
+    payload, reason = lm.ask_claude({})
+    assert reason == "" and lm.parse_candidates(payload) == ([], [])
+    monkeypatch.setattr(lm, "run", fake_run([], 0, "not json at all"))
+    payload, reason = lm.ask_claude({})
+    assert payload is None and reason
+    monkeypatch.setattr(lm, "run", fake_run([], 0, json.dumps({"is_error": True, "result": "API Error: 401"})))
+    payload, reason = lm.ask_claude({})
+    assert payload is None and "401" in reason
+
+
+def test_ask_claude_not_installed(monkeypatch):
+    monkeypatch.setattr(lm, "run", fake_run([], None, "claude not found on PATH"))
+    payload, reason = lm.ask_claude({})
+    assert payload is None and "not found" in reason
+    monkeypatch.setattr(lm, "run", fake_run([], 1, "boom"))
+    payload, reason = lm.ask_claude({})
+    assert payload is None and "boom" in reason
+
+
+def test_claude_gateway_url(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert lm.claude_gateway_url(tmp_path) is None
+    (tmp_path / "settings.json").write_text("{not json", encoding="utf-8")
+    assert lm.claude_gateway_url(tmp_path) is None
+    (tmp_path / "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gw"}}),
+                                            encoding="utf-8")
+    assert lm.claude_gateway_url(tmp_path) == "https://gw"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://from-env")
+    assert lm.claude_gateway_url(tmp_path) == "https://from-env"
+
+
+def test_choose_judge_auto_prefers_assist_api(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw")
+    name, judge, msgs = lm.choose_judge("auto", ASSIST_RAW, tmp_path)
+    assert name == "api" and callable(judge)
+    name, judge, msgs = lm.choose_judge("api", ASSIST_RAW, tmp_path)
+    assert name == "api" and callable(judge)
+
+
+def test_choose_judge_auto_skips_claude_without_gateway(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    name, judge, msgs = lm.choose_judge("auto", {}, tmp_path)
+    assert name is None and judge is None
+    assert any("--assist claude" in m for m in msgs)
+
+
+def test_choose_judge_auto_uses_claude_on_gateway(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    (tmp_path / "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gw"}}),
+                                            encoding="utf-8")
+    name, judge, msgs = lm.choose_judge("auto", {}, tmp_path)
+    assert name == "claude" and callable(judge)
+    assert not any("warning" in m for m in msgs)
+
+
+def test_choose_judge_explicit_claude_warns_off_gateway(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    name, judge, msgs = lm.choose_judge("claude", ASSIST_RAW, tmp_path)
+    assert name == "claude" and callable(judge)
+    assert any("Anthropic" in m for m in msgs)
+
+
+def test_choose_judge_api_without_usable_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw")
+    name, judge, msgs = lm.choose_judge("api", {}, tmp_path)
+    assert name is None and judge is None and any("assist" in m for m in msgs)
+    # a broken assist: block is reported, not silently replaced by Claude Code
+    name, judge, msgs = lm.choose_judge("auto", {"assist": {"base_url": "ftp://x"}}, tmp_path)
+    assert name is None and judge is None and any("base_url" in m for m in msgs)
+
+
+def test_assist_config_problems():
+    assert lm.assist_config({}) == (None, [])
+    cfg, probs = lm.assist_config({"assist": {"base_url": "ftp://x"}})
+    assert cfg is None
+    text = " ".join(probs)
+    assert "base_url" in text and "key_env" in text and "model" in text
+    cfg, probs = lm.assist_config({"assist": "nope"})
+    assert cfg is None and probs
+    cfg, probs = lm.assist_config({"assist": {"base_url": "https://judge.example/v1/", "key_env": "K", "model": "m"}})
+    assert probs == [] and cfg == {"root": "https://judge.example", "key_env": "K", "model": "m"}
