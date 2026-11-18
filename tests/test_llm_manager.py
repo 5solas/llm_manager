@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sys
 import threading
@@ -328,3 +329,277 @@ def test_discover_against_fake_gateway():
     assert block["claude-a"] == {"endpoint": "corp", "family": "claude", "context": 200000, "max_output": 32000,
                                  "reasoning": True, "tools": True, "vision": True}
     assert block["mystery"]["context"] is None
+
+
+# ---- detect
+
+@contextlib.contextmanager
+def fake_server(routes: dict, need: tuple[str, str] | None = None):
+    """routes: {path: (status, body, headers)}. need: (header, value) every request must carry, else 401."""
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _reply(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append((self.command, self.path, {k.lower(): v for k, v in self.headers.items()}))
+            if need and self.headers.get(need[0]) != need[1]:
+                status, body, headers = 401, {"error": "unauthorized"}, {}
+            else:
+                status, body, headers = routes.get(self.path, (404, {"error": "not found"}, {}))
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            for k, v in {"Content-Type": "application/json", "Content-Length": str(len(data)), **headers}.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = do_POST = _reply
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", seen
+    finally:
+        server.shutdown()
+
+
+MODELS = (200, {"data": [{"id": "m1"}]}, {})
+
+
+def test_detect_litellm_by_header_and_model_group():
+    routes = {"/v1/models": (200, {"data": [{"id": "m1"}]}, {"x-litellm-version": "1.50.0"}),
+              "/model_group/info": (200, {"data": [{"model_group": "m1"}]}, {})}
+    with fake_server(routes, need=("Authorization", "Bearer sk-1")) as (url, _):
+        res = lm.detect_server(url, "sk-1")
+    assert (res["kind"], res["auth"], res["api_base"]) == ("litellm", "bearer", "/v1")
+    assert res["renderable"] and not res["warnings"]
+
+
+def test_detect_azure_uses_api_key_header_and_openai_path():
+    routes = {"/openai/v1/models": (200, {"data": [{"id": "gpt-4o"}]}, {"apim-request-id": "abc"})}
+    with fake_server(routes, need=("api-key", "k")) as (url, _):
+        res = lm.detect_server(url, "k")
+    assert (res["kind"], res["auth"], res["api_base"]) == ("azure-openai", "api-key", "/openai/v1")
+    assert not res["renderable"]
+    assert any("Bearer" in w for w in res["warnings"])
+
+
+def test_detect_anthropic_uses_x_api_key():
+    routes = {"/v1/models": (200, {"data": [{"id": "claude-x"}]}, {"anthropic-ratelimit-requests-limit": "50"})}
+    with fake_server(routes, need=("x-api-key", "k")) as (url, seen):
+        res = lm.detect_server(url, "k")
+    assert (res["kind"], res["auth"]) == ("anthropic", "x-api-key")
+    assert seen[-1][2].get("anthropic-version")
+
+
+def test_detect_vllm_by_version_endpoint():
+    routes = {"/v1/models": MODELS, "/version": (200, {"version": "0.6.3"}, {})}
+    with fake_server(routes) as (url, _):
+        res = lm.detect_server(url, "k")
+    assert res["kind"] == "vllm" and res["renderable"]
+
+
+def test_detect_ollama_without_key():
+    routes = {"/v1/models": MODELS, "/api/tags": (200, {"models": [{"name": "qwen"}]}, {})}
+    with fake_server(routes) as (url, seen):
+        res = lm.detect_server(url, None)
+    assert (res["kind"], res["auth"]) == ("ollama", "none")
+    assert all("authorization" not in h for _, _, h in seen)
+
+
+def test_detect_plain_openai_compatible_and_proxy_layer():
+    routes = {"/v1/models": (200, {"data": [{"id": "m1"}]}, {"Via": "1.1 kong/3.4.0"})}
+    with fake_server(routes) as (url, _):
+        res = lm.detect_server(url, "k")
+    assert res["kind"] == "openai-compatible"
+    assert any("Kong" in e for e in res["evidence"])
+
+
+def test_detect_reports_rejected_key():
+    with fake_server({"/v1/models": MODELS}, need=("Authorization", "Bearer right")) as (url, _):
+        res = lm.detect_server(url, "wrong")
+    assert res["kind"] == "unknown" and res["auth"] is None
+    assert any("401" in w for w in res["warnings"])
+
+
+def test_detect_unreachable_stops_early():
+    with fake_server({}) as (url, _):
+        pass  # server is shut down: the port now refuses connections
+    res = lm.detect_server(url, "k")
+    assert res["kind"] == "unreachable" and len(res["evidence"]) == 1
+
+
+@pytest.mark.parametrize("url,kind", [
+    ("https://corp.openai.azure.com", "azure-openai"),
+    ("https://x.cognitiveservices.azure.com/openai", "azure-openai"),
+    ("https://bedrock-runtime.us-east-1.amazonaws.com", "bedrock"),
+    ("https://us-central1-aiplatform.googleapis.com", "vertex"),
+    ("https://api.openai.com", "openai"),
+    ("https://api.anthropic.com", "anthropic"),
+    ("https://llm-gateway.example.com", None),
+])
+def test_kind_from_host(url, kind):
+    assert lm.kind_from_host(url) == kind
+
+
+def test_cloud_signed_hosts_are_not_probed():
+    calls = []
+    real = lm.http_call
+    lm.http_call = lambda *a, **k: calls.append(a) or real(*a, **k)
+    try:
+        res = lm.detect_server("https://bedrock-runtime.us-east-1.amazonaws.com", "k")
+    finally:
+        lm.http_call = real
+    assert res["kind"] == "bedrock" and not calls and not res["renderable"]
+    assert any("LiteLLM" in w for w in res["warnings"])
+
+
+def test_discover_uses_detected_auth_and_path():
+    routes = {"/openai/v1/models": (200, {"data": [{"id": "gpt-4o"}]}, {}),
+              "/openai/v1/chat/completions": (200, {"ok": True}, {})}
+    with fake_server(routes, need=("api-key", "k")) as (url, seen):
+        res = lm.discover_endpoint(url, "k", auth="api-key", api_base="/openai/v1")
+    assert set(res["models"]) == {"gpt-4o"}
+    assert res["formats"]["openai-completions"]["ok"]
+    assert ("POST", "/openai/v1/chat/completions") in [(m, p) for m, p, _ in seen]
+
+
+def test_detect_command_without_catalog(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("TEST_LLM_KEY", "sk-secret-123")
+    with fake_server({"/v1/models": MODELS}, need=("Authorization", "Bearer sk-secret-123")) as (url, _):
+        code = lm.main(["--catalog", str(tmp_path / "none.yaml"), "detect", "--url", url,
+                        "--key-env", "TEST_LLM_KEY"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "openai-compatible" in out and "Bearer" in out and "sk-secret-123" not in out
+
+
+# ---- preflight (runs before build / diff / apply / verify)
+
+EXAMPLE_IDS = ["claude-opus-example", "claude-sonnet-example", "claude-haiku-example",
+               "gpt-example", "gemini-flash-example", "qwen-coder-example"]
+
+
+def gateway(ids=EXAMPLE_IDS, key="sk-pre"):
+    """LiteLLM-like fake serving `ids` behind Bearer `key`."""
+    return fake_server({"/v1/models": (200, {"data": [{"id": i} for i in ids]}, {"x-litellm-version": "1"})},
+                       need=("Authorization", f"Bearer {key}"))
+
+
+def catalog_at(url: str, key_env: str = "PRE_KEY") -> dict:
+    raw = raw_example()
+    raw["endpoints"]["corp"] = {"base_url": url, "key_env": key_env}
+    return lm.normalize_catalog(raw)
+
+
+def test_detect_reports_served_model_ids():
+    with gateway(["a", "b"]) as (url, _):
+        assert lm.detect_server(url, "sk-pre")["model_ids"] == ["a", "b"]
+
+
+def test_preflight_passes_for_working_gateway(monkeypatch):
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    with gateway() as (url, _):
+        results, problems = lm.preflight(catalog_at(url))
+    assert problems == [] and results["corp"]["kind"] == "litellm"
+
+
+def test_preflight_reports_models_the_gateway_does_not_serve(monkeypatch):
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    with gateway(EXAMPLE_IDS[:-1]) as (url, _):
+        _, problems = lm.preflight(catalog_at(url))
+    assert problems == ["corp: the gateway does not serve qwen-coder-example"]
+
+
+def test_preflight_reports_unsupported_auth(monkeypatch):
+    monkeypatch.setenv("PRE_KEY", "k")
+    routes = {"/openai/v1/models": (200, {"data": [{"id": i} for i in EXAMPLE_IDS]}, {})}
+    with fake_server(routes, need=("api-key", "k")) as (url, _):
+        _, problems = lm.preflight(catalog_at(url))
+    assert len(problems) == 1 and "api-key" in problems[0]
+
+
+def test_preflight_names_the_missing_key_variable(monkeypatch):
+    monkeypatch.delenv("PRE_KEY", raising=False)
+    with gateway() as (url, _):
+        _, problems = lm.preflight(catalog_at(url))
+    assert problems == ["corp: environment variable PRE_KEY is not set"]
+
+
+def test_preflight_reports_unreachable_gateway(monkeypatch):
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    _, problems = lm.preflight(catalog_at("http://127.0.0.1:9"))
+    assert len(problems) == 1 and "unreachable" in problems[0]
+
+
+def test_preflight_skips_endpoints_without_models(monkeypatch):
+    raw = raw_example()
+    raw["endpoints"]["spare"] = {"base_url": "http://127.0.0.1:9", "key_env": "X"}
+    for m in raw["models"].values():
+        m["endpoint"] = "corp"
+    probed = []
+    monkeypatch.setattr(lm, "detect_server", lambda url, key: probed.append(url) or
+                        {"root": url, "kind": "litellm", "auth": "bearer", "api_base": "/v1", "evidence": [],
+                         "warnings": [], "renderable": True, "model_ids": EXAMPLE_IDS})
+    lm.preflight(lm.normalize_catalog(raw))
+    assert probed == ["https://llm-gateway.example.com"]
+
+
+def write_catalog(tmp_path, url) -> Path:
+    raw = raw_example()
+    raw["endpoints"]["corp"] = {"base_url": url, "key_env": "PRE_KEY"}
+    path = tmp_path / "catalog.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return path
+
+
+def test_apply_refuses_to_install_when_preflight_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(lm, "ROOT", tmp_path)
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    home = tmp_path / "home"
+    code = lm.main(["--catalog", str(write_catalog(tmp_path, "http://127.0.0.1:9")), "apply", "--home", str(home)])
+    assert code == 3
+    assert not home.exists()
+    assert "--skip-check" in capsys.readouterr().err
+
+
+def test_apply_installs_after_passing_preflight(tmp_path, monkeypatch):
+    monkeypatch.setattr(lm, "ROOT", tmp_path)
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    home = tmp_path / "home"
+    with gateway() as (url, _):
+        code = lm.main(["--catalog", str(write_catalog(tmp_path, url)), "apply", "--home", str(home)])
+    assert code == 0
+    assert (home / ".config" / "opencode" / "opencode.json").exists()
+
+
+def test_apply_skip_check_installs_without_probing(tmp_path, monkeypatch):
+    monkeypatch.setattr(lm, "ROOT", tmp_path)
+    monkeypatch.setattr(lm, "detect_server", lambda *a: pytest.fail("must not probe"))
+    home = tmp_path / "home"
+    code = lm.main(["--catalog", str(write_catalog(tmp_path, "http://127.0.0.1:9")), "apply",
+                    "--home", str(home), "--skip-check"])
+    assert code == 0
+    assert (home / ".config" / "opencode" / "opencode.json").exists()
+
+
+def test_build_still_builds_when_preflight_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(lm, "ROOT", tmp_path)
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    code = lm.main(["--catalog", str(write_catalog(tmp_path, "http://127.0.0.1:9")), "build",
+                    "--home", str(tmp_path / "home")])
+    assert code == 0
+    assert (tmp_path / "out" / "opencode" / "opencode.json").exists()
+    assert "apply will refuse" in capsys.readouterr().out
+
+
+def test_verify_counts_preflight_problems(monkeypatch, capsys):
+    monkeypatch.setenv("PRE_KEY", "sk-pre")
+    raw = raw_example()
+    raw["endpoints"]["corp"] = {"base_url": "http://127.0.0.1:9", "key_env": "PRE_KEY"}
+    raw["tools"] = {"opencode": False, "omo": False, "hermes": False, "claude_code": False}
+    assert lm.cmd_verify(lm.normalize_catalog(raw)) == 1
+    assert "[FAIL] corp" in capsys.readouterr().out

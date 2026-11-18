@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -92,9 +93,7 @@ def normalize_catalog(raw: dict) -> dict:
         ep = ep or {}
         if not NAME_RE.match(str(name)):
             problems.append(f"endpoints.{name}: name may only use letters, digits, '-' and '_'")
-        url = str(ep.get("base_url") or "").strip().rstrip("/")
-        if url.endswith("/v1"):
-            url = url[:-3]
+        url = endpoint_root(ep.get("base_url"))
         if not url.startswith(("http://", "https://")):
             problems.append(f"endpoints.{name}.base_url: must start with http:// or https://")
         if not ep.get("key_env"):
@@ -761,30 +760,51 @@ def apply_env(cat: dict) -> None:
             print(f"claude mcp add-json {cmd[3]}: {'ok' if code == 0 else out}")
 
 
-def http_json(url: str, key: str | None, body: dict | None = None, headers: dict | None = None, timeout: int = 30):
-    """Returns (status or None, parsed JSON or error text). The key is never printed."""
+AUTH_STYLES = ("bearer", "api-key", "x-api-key")
+
+
+def auth_headers(auth: str | None, key: str | None) -> dict:
+    """Request headers for one auth style. 'none' (or no key) sends no credentials."""
+    if not key or auth in (None, "none"):
+        return {}
+    if auth == "api-key":
+        return {"api-key": key}
+    if auth == "x-api-key":
+        return {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    return {"Authorization": f"Bearer {key}"}
+
+
+def http_call(url: str, key: str | None, body: dict | None = None, headers: dict | None = None,
+              timeout: int = 30, auth: str = "bearer"):
+    """Returns (status or None, parsed JSON or error text, lower-cased response headers). The key is never printed."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method="POST" if body is not None else "GET")
     req.add_header("Content-Type", "application/json")
-    if key:
-        req.add_header("Authorization", f"Bearer {key}")
-    for k, v in (headers or {}).items():
+    for k, v in {**auth_headers(auth, key), **(headers or {})}.items():
         req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", "replace")
-            status = resp.status
+            status, resp_headers = resp.status, resp.headers
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")[:300]
+        return exc.code, exc.read().decode("utf-8", "replace")[:300], {k.lower(): v for k, v in exc.headers.items()}
     except (urllib.error.URLError, OSError) as exc:
-        return None, str(getattr(exc, "reason", exc))
+        return None, str(getattr(exc, "reason", exc)), {}
+    resp_headers = {k.lower(): v for k, v in resp_headers.items()}
     try:
-        return status, json.loads(text)
+        return status, json.loads(text), resp_headers
     except ValueError:
-        return status, text[:300]
+        return status, text[:300], resp_headers
 
 
-def discover_endpoint(root: str, key: str | None, probe_model: str | None = None) -> dict:
+def http_json(url: str, key: str | None, body: dict | None = None, headers: dict | None = None,
+              timeout: int = 30, auth: str = "bearer"):
+    """Returns (status or None, parsed JSON or error text)."""
+    return http_call(url, key, body, headers, timeout, auth)[:2]
+
+
+def discover_endpoint(root: str, key: str | None, probe_model: str | None = None,
+                      auth: str = "bearer", api_base: str = "/v1") -> dict:
     found: dict[str, dict] = {}
     sources = {}
 
@@ -802,20 +822,20 @@ def discover_endpoint(root: str, key: str | None, probe_model: str | None = None
             if target.get(dest) is None and info.get(n) is not None:
                 target[dest] = info[n]
 
-    status, body = http_json(root + "/model_group/info", key)
+    status, body = http_json(root + "/model_group/info", key, auth=auth)
     sources["/model_group/info"] = status
     if status == 200 and isinstance(body, dict):
         for item in body.get("data") or []:
             if item.get("model_group"):
                 take(entry(item["model_group"]), item)
-    status, body = http_json(root + "/v1/model/info", key)
+    status, body = http_json(root + "/v1/model/info", key, auth=auth)
     sources["/v1/model/info"] = status
     if status == 200 and isinstance(body, dict):
         for item in body.get("data") or []:
             if item.get("model_name"):
                 take(entry(item["model_name"]), item.get("model_info") or {})
-    status, body = http_json(root + "/v1/models", key)
-    sources["/v1/models"] = status if status == 200 else f"{status}: {body}"
+    status, body = http_json(root + api_base + "/models", key, auth=auth)
+    sources[api_base + "/models"] = status if status == 200 else f"{status}: {body}"
     if status == 200 and isinstance(body, dict):
         for item in body.get("data") or []:
             if item.get("id"):
@@ -826,22 +846,191 @@ def discover_endpoint(root: str, key: str | None, probe_model: str | None = None
     formats = {}
     if probe_model:
         probes = {
-            "openai-completions": ("/v1/chat/completions",
+            "openai-completions": (api_base + "/chat/completions",
                                    {"model": probe_model, "max_tokens": 16,
                                     "messages": [{"role": "user", "content": "ping"}]}, {}),
-            "anthropic-messages": ("/v1/messages",
+            "anthropic-messages": (api_base + "/messages",
                                    {"model": probe_model, "max_tokens": 16,
                                     "messages": [{"role": "user", "content": "ping"}]},
                                    {"anthropic-version": "2023-06-01"}),
-            "openai-responses": ("/v1/responses",
+            "openai-responses": (api_base + "/responses",
                                  {"model": probe_model, "input": "ping", "max_output_tokens": 16}, {}),
         }
         for name, (path, payload, headers) in probes.items():
-            status, body = http_json(root + path, key, payload, headers)
+            status, body = http_json(root + path, key, payload, headers, auth=auth)
             formats[name] = {"ok": status == 200, "status": status}
             if status != 200:
                 formats[name]["detail"] = body if isinstance(body, str) else json.dumps(body)[:300]
     return {"root": root, "sources": sources, "probe_model": probe_model, "formats": formats, "models": chat}
+
+
+HOST_KINDS = (
+    (r"\.openai\.azure\.com$|\.cognitiveservices\.azure\.com$|\.services\.ai\.azure\.com$", "azure-openai"),
+    (r"^bedrock(-runtime)?\.[a-z0-9-]+\.amazonaws\.com$", "bedrock"),
+    (r"aiplatform\.googleapis\.com$", "vertex"),
+    (r"^api\.openai\.com$", "openai"),
+    (r"^api\.anthropic\.com$", "anthropic"),
+)
+CLOUD_SIGNED = {"bedrock": "AWS SigV4", "vertex": "Google OAuth"}
+MODEL_LIST_BASES = ("/v1", "/openai/v1", "")
+AUTH_LABELS = {"bearer": "Authorization: Bearer <key>", "api-key": "api-key: <key>",
+               "x-api-key": "x-api-key: <key>", "none": "no key"}
+
+
+def endpoint_root(url: str) -> str:
+    root = str(url or "").strip().rstrip("/")
+    return root[:-3] if root.endswith("/v1") else root
+
+
+def kind_from_host(url: str) -> str | None:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return next((kind for pattern, kind in HOST_KINDS if re.search(pattern, host)), None)
+
+
+def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:
+    """Work out what kind of LLM server sits at url, which auth header it takes and where its API lives."""
+    root = endpoint_root(url)
+    res = {"root": root, "kind": None, "auth": None, "api_base": None,
+           "evidence": [], "warnings": [], "renderable": False, "model_ids": []}
+    host_kind = kind_from_host(root)
+    if host_kind:
+        res["evidence"].append(f"host name looks like {host_kind}")
+    if host_kind in CLOUD_SIGNED:
+        res["kind"] = host_kind
+        res["warnings"].append(f"{host_kind} needs {CLOUD_SIGNED[host_kind]} request signing, which these tools cannot "
+                               "do with a plain key; put an OpenAI-compatible gateway such as LiteLLM in front of it")
+        return res
+
+    seen_headers: dict = {}
+    rejected = set()
+    found = None
+    for base in MODEL_LIST_BASES:
+        for auth in (AUTH_STYLES if key else ("none",)):
+            status, body, headers = http_call(root + base + "/models", key, timeout=timeout, auth=auth)
+            if status is None:
+                res["kind"] = "unreachable"
+                res["evidence"].append(f"{root}: {body}")
+                return res
+            seen_headers.update(headers)
+            if status in (401, 403):
+                rejected.add(status)
+            if status == 200 and isinstance(body, dict) and isinstance(body.get("data"), list):
+                found = (auth, base, [str(m.get("id")) for m in body["data"] if isinstance(m, dict) and m.get("id")])
+                break
+        if found:
+            break
+    if found:
+        res["auth"], res["api_base"], res["model_ids"] = found
+        res["evidence"].append(f"{found[1]}/models lists {len(found[2])} models with {AUTH_LABELS[found[0]]}")
+
+    probe_auth = res["auth"] or ("bearer" if key else "none")
+    fingerprints = {}
+    for path, name, test in (("/model_group/info", "litellm", lambda b: isinstance(b.get("data"), list)),
+                             ("/api/tags", "ollama", lambda b: isinstance(b.get("models"), list)),
+                             ("/version", "vllm", lambda b: isinstance(b.get("version"), str))):
+        status, body, headers = http_call(root + path, key, timeout=timeout, auth=probe_auth)
+        seen_headers.update(headers)
+        if status == 200 and isinstance(body, dict) and test(body):
+            fingerprints[name] = f"{path} answers like {name}"
+
+    names = list(seen_headers)
+    if any(h.startswith("x-litellm") for h in names):
+        fingerprints.setdefault("litellm", "x-litellm-* response headers")
+    if "apim-request-id" in names or "x-ms-region" in names:
+        fingerprints["azure-openai"] = "Azure response headers (apim-request-id / x-ms-region)"
+    if any(h.startswith("anthropic-") for h in names):
+        fingerprints["anthropic"] = "anthropic-* response headers"
+    if any(h.startswith("openai-") for h in names):
+        fingerprints["openai"] = "openai-* response headers"
+    if "kong" in seen_headers.get("via", "").lower() or any(h.startswith("x-kong") for h in names):
+        res["evidence"].append("requests pass through a Kong API gateway")
+    if "x-amzn-requestid" in names:
+        res["evidence"].append("requests pass through AWS (x-amzn-requestid header)")
+    res["evidence"] += list(fingerprints.values())
+
+    by_auth = {"api-key": "azure-openai", "x-api-key": "anthropic"}.get(res["auth"])
+    for kind in ("litellm", "ollama", "vllm", host_kind, "azure-openai", "anthropic", "openai", by_auth):
+        if kind and (kind in fingerprints or kind in (host_kind, by_auth)):
+            res["kind"] = kind
+            break
+    else:
+        res["kind"] = "openai-compatible" if found else "unknown"
+
+    if not found:
+        if rejected and key:
+            codes = "/".join(str(c) for c in sorted(rejected))
+            res["warnings"].append(f"the key was rejected (HTTP {codes}) with every auth style tried "
+                                   "(Authorization: Bearer, api-key, x-api-key) - check the key and its permissions")
+        elif rejected:
+            res["warnings"].append("the server wants a key - set the environment variable named in key_env")
+        else:
+            res["warnings"].append("no model list at /v1/models, /openai/v1/models or /models - "
+                                   "check base_url or ask the gateway team for the API path")
+    elif res["auth"] in ("bearer", "none") and res["api_base"] == "/v1":
+        res["renderable"] = True
+    elif res["auth"] in ("bearer", "none") and res["api_base"].endswith("/v1"):
+        res["warnings"].append(f"the API lives under {root}{res['api_base']}; "
+                               f"set base_url to {root}{res['api_base']} in catalog.yaml")
+    else:
+        res["warnings"].append(f"this server takes {AUTH_LABELS[res['auth']]} at {root}{res['api_base'] or '/'}, but the "
+                               "configs llm_manager writes use Authorization: Bearer at <base_url>/v1, "
+                               "so the tools will not connect to it yet")
+    return res
+
+
+def print_detection(name: str, det: dict) -> None:
+    print(f"[{name}] {det['root']}")
+    print(f"  server:  {det['kind']}")
+    if det["auth"]:
+        print(f"  auth:    {AUTH_LABELS[det['auth']]}")
+        print(f"  api:     {det['root']}{det['api_base']}")
+    for item in det["evidence"]:
+        print(f"  seen:    {item}")
+    for item in det["warnings"]:
+        print(f"  warning: {item}")
+
+
+def cmd_detect(targets: list[tuple[str, str, str | None]]) -> dict:
+    """targets: (name, base_url, key_env). Prints what each server is; never prints a key."""
+    results = {}
+    for name, url, key_env in targets:
+        key = os.environ.get(key_env or "")
+        if key_env and not key:
+            print(f"warning: environment variable {key_env} is not set; probing {name} without a key")
+        results[name] = detect_server(url, key)
+        print_detection(name, results[name])
+    return results
+
+
+def preflight(cat: dict) -> tuple[dict, list[str]]:
+    """Probe every endpoint the catalog puts models on, before configs are built or installed.
+
+    Returns (detections by endpoint, problems). A problem means the tools would not work against that endpoint.
+    """
+    used = {m["endpoint"] for m in cat["models"].values()}
+    # opencode, omo and hermes speak OpenAI chat completions with Bearer auth at <base_url>/v1
+    needs_openai = any(cat["tools"][t] for t in ("opencode", "omo", "hermes"))
+    targets = [(n, ep) for n, ep in cat["endpoints"].items() if n in used]
+    print(f"preflight: checking {len(targets)} endpoint(s)")
+    results, problems = {}, []
+    for name, ep in targets:
+        key = os.environ.get(ep["key_env"])
+        det = detect_server(ep["root"], key)
+        results[name] = det
+        print_detection(name, det)
+        if det["kind"] == "unreachable":
+            problems.append(f"{name}: {det['root']} is unreachable ({det['evidence'][-1]})")
+        elif not det["auth"] and not key:
+            problems.append(f"{name}: environment variable {ep['key_env']} is not set")
+        elif not det["renderable"] and (needs_openai or not det["auth"]):
+            problems.append(f"{name}: " + (det["warnings"][0] if det["warnings"]
+                                           else "the generated configs cannot connect to this server"))
+        else:
+            absent = [m for m, i in cat["models"].items() if i["endpoint"] == name and m not in det["model_ids"]]
+            if absent:
+                problems.append(f"{name}: the gateway does not serve {', '.join(absent)}")
+    print("preflight: ok" if not problems else f"preflight: {len(problems)} problem(s)")
+    return results, problems
 
 
 def models_yaml(endpoint: str, models: dict) -> str:
@@ -862,14 +1051,20 @@ def models_yaml(endpoint: str, models: dict) -> str:
 def cmd_discover(raw: dict, out_file: Path, probe_model: str | None) -> dict:
     results = {}
     for name, ep in (raw.get("endpoints") or {}).items():
-        root = str(ep.get("base_url") or "").rstrip("/")
-        root = root[:-3] if root.endswith("/v1") else root
+        root = endpoint_root(ep.get("base_url"))
         key = os.environ.get(ep.get("key_env") or "")
         if not key:
             print(f"warning: environment variable {ep.get('key_env')} is not set; calling {name} without a key")
-        res = discover_endpoint(root, key, probe_model)
+        det = detect_server(root, key)
+        print_detection(name, det)
+        if det["kind"] in ("unreachable", *CLOUD_SIGNED):
+            results[name] = {"root": root, "server": det}
+            print(f"  skipped model discovery for {name}\n")
+            continue
+        res = discover_endpoint(root, key, probe_model, auth=det["auth"] or "bearer",
+                                api_base="/v1" if det["api_base"] is None else det["api_base"])
+        res["server"] = det
         results[name] = res
-        print(f"[{name}] {root}")
         for src, status in res["sources"].items():
             print(f"  {src}: {status}")
         for fmt, r in res["formats"].items():
@@ -897,15 +1092,10 @@ def cmd_verify(cat: dict) -> int:
             continue
         code, out = run([exe, "--version"])
         report(code == 0, f"{exe} installed", out.splitlines()[0] if out else "")
-    for name, ep in cat["endpoints"].items():
-        key = os.environ.get(ep["key_env"])
-        report(bool(key), f"environment variable {ep['key_env']} is set")
-        status, body = http_json(ep["root"] + "/v1/models", key)
-        served = {m.get("id") for m in body.get("data", [])} if status == 200 and isinstance(body, dict) else set()
-        report(status == 200, f"gateway {name} answers /v1/models", "" if status == 200 else f"{status}: {body}")
-        if served:
-            absent = [m for m, i in cat["models"].items() if i["endpoint"] == name and m not in served]
-            report(not absent, f"gateway {name} serves every catalog model", ", ".join(absent))
+    detections, problems = preflight(cat)
+    for name, det in detections.items():
+        mine = [p.split(": ", 1)[1] for p in problems if p.startswith(name + ": ")]
+        report(not mine, f"{name} gateway ({det['kind']})", "; ".join(mine))
     cc = cat["claude_code"]
     if cat["tools"]["claude_code"] and cc["model"]:
         report(bool(os.environ.get(cc["key_env"])), f"environment variable {cc['key_env']} is set (Claude Code)")
@@ -935,9 +1125,14 @@ def main(argv: list[str] | None = None) -> int:
                        ("apply", "back up and install the configs")):
         p = sub.add_parser(name, help=text)
         p.add_argument("--home", type=Path, help="install under this folder instead of your home (for testing)")
+        p.add_argument("--skip-check", action="store_true",
+                       help="do not probe the gateways first (offline use; apply then installs without checking)")
         if name == "apply":
             p.add_argument("--env", action="store_true",
                            help="also set non-secret environment variables and register Claude Code MCP servers")
+    p = sub.add_parser("detect", help="identify each gateway's server type, auth header and API path")
+    p.add_argument("--url", help="probe this address instead of the catalog endpoints (no catalog needed)")
+    p.add_argument("--key-env", help="with --url: name of the environment variable holding the key")
     sub.add_parser("verify", help="check tools, keys and the gateway")
     args = parser.parse_args(argv)
 
@@ -948,7 +1143,30 @@ def main(argv: list[str] | None = None) -> int:
             raw = yaml.safe_load(args.catalog.read_text(encoding="utf-8")) or {}
             cmd_discover(raw, ROOT / "discovered.json", args.probe_model)
             return 0
+        if args.command == "detect":
+            if args.url:
+                targets = [("url", args.url, args.key_env)]
+            else:
+                if not args.catalog.exists():
+                    raise CatalogError([f"{args.catalog} not found - copy catalog.example.yaml to catalog.yaml "
+                                        "first, or pass --url"])
+                raw = yaml.safe_load(args.catalog.read_text(encoding="utf-8")) or {}
+                targets = [(n, (ep or {}).get("base_url"), (ep or {}).get("key_env"))
+                           for n, ep in (raw.get("endpoints") or {}).items()]
+            found = cmd_detect(targets)
+            return 1 if any(d["kind"] in ("unreachable", "unknown") for d in found.values()) else 0
         cat = load_catalog(args.catalog)
+        if args.command in ("build", "diff", "apply") and not args.skip_check:
+            _, problems = preflight(cat)
+            if problems and args.command == "apply":
+                print("preflight failed - nothing was installed:", file=sys.stderr)
+                for problem in problems:
+                    print("  -", problem, file=sys.stderr)
+                print("fix these, or re-run with --skip-check to install anyway", file=sys.stderr)
+                return 3
+            if problems:
+                print("preflight: apply will refuse to install until these are fixed: " + "; ".join(problems))
+            print()
         if args.command == "build":
             cmd_build(cat, args.home, ROOT / "out")
         elif args.command == "diff":

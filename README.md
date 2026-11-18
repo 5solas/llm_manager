@@ -26,21 +26,54 @@ opencode service set env COMPANY_LLM_KEY "<내 키>"     # opencode2는 백그�
 copy catalog.example.yaml catalog.yaml
 notepad catalog.yaml                                   # endpoints.corp.base_url 수정
 
-# 3. 게이트웨이에서 모델 목록과 지원 API 형식 조회
+# 3. 게이트웨이 서버 종류 확인 후 모델 목록과 지원 API 형식 조회
+uv run llm_manager.py detect       # 서버 종류·인증 헤더·API 경로 (discover도 먼저 이걸 실행합니다)
 uv run llm_manager.py discover
 #    출력된 models 블록을 catalog.yaml에 붙여 넣고, tiers / default 를 정합니다.
 #    context 가 비어 있는 모델은 직접 채워야 합니다.
 
-# 4. 만들고, 바뀔 내용을 확인하고, 설치
+# 4. 만들고, 바뀔 내용을 확인하고, 설치 (셋 다 게이트웨이 점검을 먼저 합니다)
 uv run llm_manager.py build        # out/ 에 생성 (검토용)
 uv run llm_manager.py diff         # 지금 설정과의 차이
-uv run llm_manager.py apply --env  # 백업 후 설치 + 환경변수 설정
+uv run llm_manager.py apply --env  # 점검 통과 시 백업 후 설치 + 환경변수 설정
 
 # 5. 확인
 uv run llm_manager.py verify
 ```
 
 모델이나 정책을 바꿀 때는 `catalog.yaml`을 고치고 `diff` → `apply`를 다시 실행합니다.
+
+## 실행 전 게이트웨이 점검
+
+`build`, `diff`, `apply`, `verify`는 시작할 때 카탈로그에서 모델이 배정된 endpoint를 모두 점검합니다. endpoint마다 아래를 확인합니다.
+
+- 서버 종류: LiteLLM, vLLM, Ollama, Azure OpenAI, Anthropic, OpenAI, Bedrock, Vertex, 그 밖의 OpenAI 호환
+- 받는 인증 헤더: `Authorization: Bearer`, `api-key`, `x-api-key`
+- API 경로: `/v1`, `/openai/v1` 등
+- 카탈로그의 모델을 실제로 제공하는지
+
+아래 경우는 문제로 봅니다.
+
+- 접속이 안 될 때
+- 키 환경변수가 없거나 키가 거부될 때
+- 생성되는 설정이 아직 쓸 수 없는 형식일 때 (Bearer + `<base_url>/v1`이 아닌 경우)
+- 게이트웨이에 없는 모델이 카탈로그에 있을 때
+
+문제가 있으면 명령마다 다르게 동작합니다.
+
+| 명령 | 문제가 있을 때 |
+|---|---|
+| `apply` | 아무것도 설치하지 않고 종료 코드 3으로 끝냅니다 |
+| `build`, `diff` | 문제를 알려 주고, 결과는 그대로 만듭니다 |
+| `verify` | 실패 항목으로 셉니다 |
+
+망이 끊긴 곳에서 설치해야 하면 `--skip-check`로 점검을 건너뜁니다 (`build`, `diff`, `apply`).
+
+카탈로그 없이 주소 하나만 점검할 수도 있습니다. 키 값은 출력되지 않습니다.
+
+```powershell
+uv run llm_manager.py detect --url https://llm-gateway.example.com --key-env COMPANY_LLM_KEY
+```
 
 ## 무엇이 설치되나
 
