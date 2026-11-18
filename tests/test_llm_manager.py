@@ -753,6 +753,35 @@ def test_evidence_bodies_are_capped():
     assert ev["probes"] and all(len(p["body"]) <= 500 for p in ev["probes"])
 
 
+KEY = "sk-cutkey-0123456789abcdefghij"
+
+
+def test_evidence_hides_key_cut_by_http_call():
+    # http_call cuts error bodies to 300 characters, so the key arrives with its tail missing
+    with fake_server({"/v1/models": (401, "x" * 280 + KEY, {})}) as (url, _):
+        det = lm.detect_server(url, KEY)
+    assert all(KEY[:3] not in p["body"] for p in det["probes"])
+    text = json.dumps(lm.build_evidence(det, KEY))
+    assert KEY[:3] not in text and "<key>" in text
+
+
+def test_evidence_hides_key_cut_by_body_cap():
+    det = {"probes": [{"method": "GET", "path": "/x", "auth": "bearer", "status": 401, "headers": {},
+                       "body": "y" * 480 + KEY + "z" * 100}]}
+    ev = lm.build_evidence(det, KEY)
+    body = ev["probes"][0]["body"]
+    assert KEY[:3] not in body and "y" * 480 + "<key>z" in body and len(body) == lm.PROBE_BODY_MAX
+
+
+def test_redact_body_strips_trailing_key_prefix():
+    assert lm.redact_body("abc " + KEY[:10], KEY) == "abc <key>"
+    assert lm.redact_body("abc " + json.dumps("a\"" + KEY)[1:6], "a\"" + KEY) == "abc <key>"
+    assert lm.redact_body("abc sk", KEY) == "abc sk"  # too short to tell apart from ordinary text
+    assert lm.redact_body("z" * 600, KEY) == "z" * lm.PROBE_BODY_MAX
+    capped = lm.redact_body("z" * 498 + KEY[:10], KEY)
+    assert KEY[:2] not in capped and len(capped) == lm.PROBE_BODY_MAX
+
+
 def test_redact_short_key_is_left_alone():
     assert lm.redact("abc sk-1234 abc", "sk-1234") == "abc <key> abc"
     assert lm.redact("abc", "abc") == "abc"

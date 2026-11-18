@@ -939,6 +939,24 @@ def redact(text: str, key: str | None) -> str:
     return text.replace(escaped, "<key>") if escaped != key else text
 
 
+KEY_TAIL_MIN = 3  # shorter tails reveal next to nothing and match ordinary text too often
+
+
+def redact_body(text: str, key: str | None, limit: int = PROBE_BODY_MAX) -> str:
+    """redact() the whole body, hide a key cut short at its end (http_call cuts bodies), then cap it.
+
+    Redacting before capping means the cap never cuts a whole key in half."""
+    text = redact(text, key)
+    if key and len(key) >= 4:
+        for spelling in (key, json.dumps(key)[1:-1]):
+            n = next((n for n in range(len(spelling) - 1, KEY_TAIL_MIN - 1, -1)
+                      if text.endswith(spelling[:n])), 0)
+            if n:
+                text = text[:-n] + "<key>"
+                break
+    return text[:limit]
+
+
 def openapi_summary(body) -> dict | None:
     """Path list and security schemes of an OpenAPI (or Swagger 2) document, or None if body is not one."""
     if not isinstance(body, dict) or not isinstance(body.get("paths"), dict):
@@ -968,12 +986,10 @@ def build_evidence(det: dict, key: str | None) -> dict:
                        "status": p.get("status"),
                        "headers": {str(k).lower(): v for k, v in (p.get("headers") or {}).items()
                                    if str(k).lower() not in SECRET_HEADERS},
-                       "body": str(p.get("body") or "")[:PROBE_BODY_MAX]})
+                       "body": redact_body(str(p.get("body") or ""), key)})
     ev = _scrub({"root": det.get("root"), "kind": det.get("kind"), "auth": det.get("auth"),
                  "api_base": det.get("api_base"), "warnings": det.get("warnings") or [],
                  "probes": probes, "openapi": det.get("openapi")}, key)
-    for p in ev["probes"]:
-        p["body"] = p["body"][:PROBE_BODY_MAX]  # redaction can shift length; cap again
     if key and len(key) >= 4 and key in json.dumps(ev, ensure_ascii=False):
         raise ValueError("evidence still contains the key after redaction")
     return ev
@@ -993,7 +1009,7 @@ def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:
         res["probes"].append({"method": "GET", "path": path, "auth": auth, "status": status,
                               "headers": {k: redact(str(v), key) for k, v in headers.items()
                                           if k not in SECRET_HEADERS},
-                              "body": redact(text, key)[:PROBE_BODY_MAX]})
+                              "body": redact_body(text, key)})
         return status, body, headers
     host_kind = kind_from_host(root)
     if host_kind:
