@@ -786,3 +786,85 @@ def test_redact_short_key_is_left_alone():
     assert lm.redact("abc sk-1234 abc", "sk-1234") == "abc <key> abc"
     assert lm.redact("abc", "abc") == "abc"
     assert lm.redact("abc", None) == "abc"
+
+
+# ---- assist: candidates
+
+def cand(**kw) -> dict:
+    return {"api": "azure-openai", "auth": "api-key", "api_base": "/openai/v1", **kw}
+
+
+def test_parse_candidates_from_fenced_text():
+    text = ('Here:\n```json\n{"candidates":[{"api":"azure-openai","auth":"api-key",'
+            '"api_base":"/openai/v1","reason":"apim"}]}\n```')
+    cands, probs = lm.parse_candidates(text)
+    assert probs == []
+    assert cands == [{"api": "azure-openai", "auth": "api-key", "api_base": "/openai/v1",
+                      "query": {}, "extra_headers": [], "reason": "apim"}]
+
+
+def test_parse_candidates_rejects_bad_answers():
+    cands, probs = lm.parse_candidates("no idea")
+    assert cands == [] and len(probs) == 1
+    cands, probs = lm.parse_candidates({"candidates": [cand(api="grpc"), cand()]})
+    assert [c["api"] for c in cands] == ["azure-openai"] and len(probs) == 1 and "grpc" in probs[0]
+    cands, probs = lm.parse_candidates({"candidates": [cand(reason=str(i)) for i in range(5)]})
+    assert [c["reason"] for c in cands] == ["0", "1", "2"]
+    for bad in (None, 42, {"candidates": "x"}, "{broken json", "```json\n{\"candidates\": [\n```"):
+        cands, probs = lm.parse_candidates(bad)
+        assert cands == [] and probs
+
+
+def test_parse_candidates_rejects_foreign_hosts():
+    payload = {"candidates": [cand(api_base="https://evil.example/v1"), cand(api_base="//evil/v1"),
+                              cand(api_base="v1"), cand(api_base="/a://b")]}
+    cands, probs = lm.parse_candidates(payload)
+    assert cands == [] and len(probs) == 4
+
+
+def test_parse_candidates_drops_credential_and_malformed_headers():
+    headers = ["Authorization", "api-key", "Cookie", "X Bad", "X-Ok\r\nY: z", "X-Tenant-Id"]
+    cands, probs = lm.parse_candidates({"candidates": [cand(extra_headers=headers)]})
+    assert cands[0]["extra_headers"] == ["X-Tenant-Id"]
+    assert len(probs) == 5
+
+
+def test_header_env_name():
+    assert lm.header_env_name("X-Tenant-Id") == "X_TENANT_ID"
+    assert lm.header_env_name("x.trace id") == "X_TRACE_ID"
+
+
+def test_http_call_appends_query():
+    routes = {"/m?api-version=2024-10-21&a=b+c": MODELS}
+    with fake_server(routes) as (url, seen):
+        status, _, _ = lm.http_call(url + "/m", None, query={"api-version": "2024-10-21", "a": "b c"})
+    assert status == 200
+
+
+def test_verify_candidate_verified_with_query():
+    routes = {"/openai/models?api-version=2024-10-21": (200, {"data": [{"id": "gpt-4o"}]}, {})}
+    with fake_server(routes, need=("api-key", "k")) as (url, _):
+        res = lm.verify_candidate(url, "k", cand(api_base="/openai", query={"api-version": "2024-10-21"},
+                                                 extra_headers=[], reason="r"))
+    assert res["status"] == "verified" and res["reason"] == "r"
+
+
+def test_verify_candidate_failed():
+    with fake_server({"/openai/v1/models": MODELS}, need=("api-key", "k")) as (url, _):
+        res = lm.verify_candidate(url, "k", cand(auth="bearer", query={}, extra_headers=[]))
+    assert res["status"] == "failed" and "401" in res["detail"]
+    with fake_server({"/openai/v1/models": (200, {"object": "list"}, {})}) as (url, _):
+        res = lm.verify_candidate(url, "k", cand(query={}, extra_headers=[]))
+    assert res["status"] == "failed"
+
+
+def test_verify_candidate_needs_value_then_uses_env(monkeypatch):
+    c = cand(auth="bearer", query={}, extra_headers=["X-Tenant-Id"])
+    monkeypatch.delenv("X_TENANT_ID", raising=False)
+    with fake_server({"/openai/v1/models": MODELS}, need=("X-Tenant-Id", "t1")) as (url, seen):
+        res = lm.verify_candidate(url, "k", c)
+        assert res["status"] == "needs value" and "X_TENANT_ID" in res["detail"]
+        assert seen == []
+        monkeypatch.setenv("X_TENANT_ID", "t1")
+        res = lm.verify_candidate(url, "k", c)
+    assert res["status"] == "verified"

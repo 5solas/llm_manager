@@ -813,8 +813,12 @@ def auth_headers(auth: str | None, key: str | None) -> dict:
 
 
 def http_call(url: str, key: str | None, body: dict | None = None, headers: dict | None = None,
-              timeout: int = 30, auth: str = "bearer"):
-    """Returns (status or None, parsed JSON or error text, lower-cased response headers). The key is never printed."""
+              timeout: int = 30, auth: str = "bearer", query: dict | None = None):
+    """Returns (status or None, parsed JSON or error text, lower-cased response headers). The key is never printed.
+
+    query is url-encoded and appended to url."""
+    if query:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(query)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method="POST" if body is not None else "GET")
     req.add_header("Content-Type", "application/json")
@@ -993,6 +997,136 @@ def build_evidence(det: dict, key: str | None) -> dict:
     if key and len(key) >= 4 and key in json.dumps(ev, ensure_ascii=False):
         raise ValueError("evidence still contains the key after redaction")
     return ev
+
+
+ASSIST_APIS = ("openai-chat", "openai-responses", "anthropic-messages", "azure-openai")
+ASSIST_MAX_CANDIDATES = 3
+ASSIST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "maxItems": ASSIST_MAX_CANDIDATES,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "api": {"type": "string", "enum": list(ASSIST_APIS)},
+                    "auth": {"type": "string", "enum": list(AUTH_STYLES + ("none",))},
+                    "api_base": {"type": "string", "description": "path under the server root, e.g. /openai/v1"},
+                    "query": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "extra_headers": {"type": "array", "items": {"type": "string"},
+                                      "description": "names of non-credential headers that need a value"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["api", "auth", "api_base", "query", "extra_headers", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["candidates"],
+    "additionalProperties": False,
+}
+HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+CREDENTIAL_HEADERS = SECRET_HEADERS | {"x-goog-api-key", "anthropic-api-key"}
+API_BASE_BAD = re.compile(r"[\s\x00-\x1f\x7f?#\\]")
+
+
+def _first_json_object(text: str):
+    """The first {...} in text that parses as a JSON object (fences and prose around it are ignored)."""
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == "{":
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return None
+
+
+def _check_candidate(c, n: int, problems: list[str]) -> dict | None:
+    where = f"candidate {n}"
+    if not isinstance(c, dict):
+        problems.append(f"{where}: not an object")
+        return None
+    if c.get("api") not in ASSIST_APIS:
+        problems.append(f"{where}: unknown api {c.get('api')!r}")
+        return None
+    if c.get("auth") not in AUTH_STYLES + ("none",):
+        problems.append(f"{where}: unknown auth {c.get('auth')!r}")
+        return None
+    base = c.get("api_base")
+    # api_base is joined to the endpoint's own root, so it must stay a path: no scheme, no //host, no query
+    if (not isinstance(base, str) or (base and not base.startswith("/")) or base.startswith("//")
+            or "://" in base or API_BASE_BAD.search(base)):
+        problems.append(f"{where}: api_base {base!r} is not a path on this server")
+        return None
+    query = c.get("query") or {}
+    if not isinstance(query, dict) or not all(isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                                              for v in query.values()):
+        problems.append(f"{where}: query must map names to values")
+        return None
+    headers = c.get("extra_headers") or []
+    if not isinstance(headers, list):
+        problems.append(f"{where}: extra_headers must be a list")
+        return None
+    kept = []
+    for h in headers:
+        if not isinstance(h, str) or not HEADER_NAME_RE.match(h):
+            problems.append(f"{where}: dropped malformed header name {h!r}")
+        elif h.lower() in CREDENTIAL_HEADERS:
+            problems.append(f"{where}: dropped credential header {h!r}")
+        elif h not in kept:
+            kept.append(h)
+    return {"api": c["api"], "auth": c["auth"], "api_base": base.rstrip("/"),
+            "query": {str(k): str(v) for k, v in query.items()}, "extra_headers": kept,
+            "reason": str(c.get("reason") or "")}
+
+
+def parse_candidates(payload: object) -> tuple[list[dict], list[str]]:
+    """Validate a judge's answer (a dict, or text holding a JSON object). Returns (at most 3 candidates, problems)."""
+    if isinstance(payload, str):
+        obj = _first_json_object(payload)
+        if obj is None:
+            return [], ["answer holds no JSON object"]
+        payload = obj
+    if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+        return [], ["answer has no 'candidates' list"]
+    cands, problems = [], []
+    for n, c in enumerate(payload["candidates"], 1):
+        checked = _check_candidate(c, n, problems)
+        if checked:
+            cands.append(checked)
+    if len(cands) > ASSIST_MAX_CANDIDATES:
+        problems.append(f"only the first {ASSIST_MAX_CANDIDATES} of {len(cands)} candidates are used")
+    return cands[:ASSIST_MAX_CANDIDATES], problems
+
+
+def header_env_name(header: str) -> str:
+    """Environment variable that holds an extra header's value: X-Tenant-Id -> X_TENANT_ID."""
+    return re.sub(r"[^A-Za-z0-9]", "_", header).upper()
+
+
+def verify_candidate(root: str, key: str | None, cand: dict, timeout: int = 10) -> dict:
+    """Try a candidate for real: GET <root><api_base>/models. Extra header values come only from the environment."""
+    extra, missing = {}, []
+    for h in cand.get("extra_headers") or []:
+        env = header_env_name(h)
+        value = os.environ.get(env, "")
+        if not value or "\r" in value or "\n" in value:
+            missing.append(f"{env} (for {h})")
+        else:
+            extra[h] = value
+    if missing:
+        return {**cand, "status": "needs value", "detail": "set " + ", ".join(missing)}
+    status, body, _ = http_call(root + cand["api_base"] + "/models", key, headers=extra, timeout=timeout,
+                                auth=cand["auth"], query=cand.get("query") or None)
+    if status == 200 and isinstance(body, dict) and isinstance(body.get("data"), list):
+        return {**cand, "status": "verified", "detail": f"{len(body['data'])} models listed"}
+    text = body if isinstance(body, str) else json.dumps(body)
+    reason = "no model list" if status == 200 else f"HTTP {status}" if status else "unreachable"
+    return {**cand, "status": "failed", "detail": f"{reason}: {redact_body(text, key, 200)}"}
 
 
 def detect_server(url: str, key: str | None, timeout: int = 10) -> dict:
